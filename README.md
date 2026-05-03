@@ -21,6 +21,7 @@ When Bash prompts you for a command, a library called [readline](https://www.gnu
 - [Mouse support](#mouse-support)
 - [Improvements to Bash's tab completion](#tab-completion-improvements)
 - Tooltips
+- Text selection
 - Auto close brackets and quotes
 - Syntax highlighting
 - Runs in the same process as Bash
@@ -34,14 +35,14 @@ Flyline is similar to [ble.sh](https://github.com/akinomyoga/ble.sh) but is writ
 
 # Installation
 
-### Quick install: run `install.sh`
+### Quick install: `install.sh`
 
 > [!TIP]
-> Quick install:
-> run the following command to automatically download flyline and update your `.bashrc` to load the latest version:
+> Run the following command to automatically download flyline and update your `.bashrc` to load the latest version:
 ```bash
 curl -sSfL https://raw.githubusercontent.com/HalFrgrd/flyline/master/install.sh | sh
 ```
+No need for `sudo`!
 
 > [!IMPORTANT]
 > On macOS you must first install a version of bash that supports custom builtins: `brew install bash`
@@ -290,7 +291,7 @@ Examples:
   PS1='\u@\h:\w [CUSTOM_WIDGET1] $ '
 
   # Non-blocking with a 10-space placeholder while the new output is being computed.
-  flyline create-prompt-widget custom --name CUSTOM_WIDGET1 --command 'run_slow_git_metrics.sh' --placeholder 10
+  flyline create-prompt-widget custom --name CUSTOM_WIDGET1 --command 'run_slow_git_metrics.sh' --placeholder prev
 
   # Blocking: waits for the command to finish before showing the prompt.
   flyline create-prompt-widget custom --name CUSTOM_WIDGET2 --command 'run_something.sh' --block
@@ -572,7 +573,7 @@ A context expression may combine multiple variables with `+`:
 ```bash
 flyline key bind Tab inlineSuggestionAvailable+cursorAtEnd=acceptInlineSuggestion
 ```
-`||` and parentheses are not supported.  Use `!` in front of a variable to negate it (e.g. `!textSelected`).
+Use `!` in front of a variable to negate it (e.g. `!textSelected`). Parentheses are not supported. 
 
 It is possible to remap keys entirely with:
 ```bash
