@@ -8,7 +8,7 @@ Require claude
 
 Hide
 Sleep 50ms
-Type `flyline editor --auto-close-chars true && flyline key bind PageUp always=moveLeftOneWordWhitespaceExtendSelection && clear`
+Type `flyline editor --auto-close-chars true && flyline key bind PageUp always=moveLeftOneWordExtendSelection && clear`
 Enter
 Show
 
@@ -52,7 +52,7 @@ Sleep 1500ms
 Type ` $HOME`
 Sleep 1500ms
 Type ` && echo $BASH_VERSINFO`
-Sleep 1500ms
+Sleep 2000ms
 Ctrl+C
 Sleep 800ms
 

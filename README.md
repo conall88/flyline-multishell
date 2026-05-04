@@ -38,11 +38,11 @@ Flyline is similar to [ble.sh](https://github.com/akinomyoga/ble.sh) but is writ
 ### Quick install: `install.sh`
 
 > [!TIP]
-> Run the following command to automatically download flyline and update your `.bashrc` to load the latest version:
+> Run the following command to download flyline and update your `.bashrc` to load the latest version. No need for `sudo`!
 ```bash
 curl -sSfL https://raw.githubusercontent.com/HalFrgrd/flyline/master/install.sh | sh
 ```
-No need for `sudo`!
+
 
 > [!IMPORTANT]
 > On macOS you must first install a version of bash that supports custom builtins: `brew install bash`
@@ -98,7 +98,7 @@ Then you can simply run `enable flyline`.
 Flyline sets up its own tab completion
 so you can type `flyline <Tab>` in your shell to interactively browse and configure settings. Copy the commands into your `.bashrc` so they persist.
 
-Explore this readme and [examples](examples/) for what you can configure.
+Explore this README and [examples](examples/) for what you can configure.
 
 # Rich prompts
 
@@ -290,7 +290,7 @@ Examples:
   # PS1 usage:
   PS1='\u@\h:\w [CUSTOM_WIDGET1] $ '
 
-  # Non-blocking with a 10-space placeholder while the new output is being computed.
+  # Non-blocking with previous output placeholder while the new output is being computed.
   flyline create-prompt-widget custom --name CUSTOM_WIDGET1 --command 'run_slow_git_metrics.sh' --placeholder prev
 
   # Blocking: waits for the command to finish before showing the prompt.
@@ -571,7 +571,7 @@ The `always` context variable is always true.
 
 A context expression may combine multiple variables with `+`:
 ```bash
-flyline key bind Tab inlineSuggestionAvailable+cursorAtEnd=acceptInlineSuggestion
+flyline key bind Tab inlineSuggestionAvailable+cursorAtEnd=inlineSuggestionAccept
 ```
 Use `!` in front of a variable to negate it (e.g. `!textSelected`). Parentheses are not supported. 
 
