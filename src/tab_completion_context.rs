@@ -191,6 +191,16 @@ pub fn get_completion_context<'a>(
                     Some(t) if t.token.kind == TokenKind::Dollar => {
                         start = t.token.byte_range().start;
                     }
+                    Some(t) if t.token.kind == TokenKind::RBrace => {
+                        // Merge brace expressions like {foo,bar} with following glob patterns like *
+                        // Find the matching LBrace by looking at the closing annotation
+                        if let Some(closing) = &t.annotations.closing {
+                            if let Some(opening_token) = context_tokens.get(closing.opening_idx) {
+                                start = opening_token.token.byte_range().start;
+                                break; // Stop here after merging the entire brace group
+                            }
+                        }
+                    }
                     _ => break,
                 }
             }
@@ -1365,5 +1375,12 @@ mod tests {
                 CompType::FuzzyFilenameExpansion
             ]
         );
+    }
+
+    #[test]
+    fn test_brace_expansion() {
+        let ctx = run_inline(r"echo {foo,bar}*█");
+
+        assert_eq!(ctx.word_under_cursor.as_ref(), r"{foo,bar}*");
     }
 }
