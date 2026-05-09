@@ -652,6 +652,7 @@ pub struct ActiveSuggestionsBuilder {
     pub processed: Vec<ProcessedSuggestion>,
     pub unprocessed: VecDeque<UnprocessedSuggestion>,
     pub auto_accept_if_solo: bool,
+    pub insert_common_prefix: bool,
     pub common_prefix: Option<String>,
     pub comp_type: tab_completion_context::CompType,
 }
@@ -664,6 +665,7 @@ impl ActiveSuggestionsBuilder {
             processed: Vec::new(),
             unprocessed: VecDeque::new(),
             auto_accept_if_solo: true,
+            insert_common_prefix: true,
             common_prefix: None,
             comp_type: tab_completion_context::CompType::default(),
         }
@@ -674,6 +676,11 @@ impl ActiveSuggestionsBuilder {
     /// single candidate survives the fuzzy scoring.
     pub fn with_auto_accept_if_solo(mut self, auto_accept_if_solo: bool) -> Self {
         self.auto_accept_if_solo = auto_accept_if_solo;
+        self
+    }
+
+    pub fn with_insert_common_prefix(mut self, insert_common_prefix: bool) -> Self {
+        self.insert_common_prefix = insert_common_prefix;
         self
     }
 
@@ -772,11 +779,11 @@ impl ActiveSuggestionsBuilder {
 /// expensive rendering work is done on demand in [`ActiveSuggestions::into_grid`].
 ///
 /// `suggestion_idx` is an index into [`ActiveSuggestions::processed_suggestions`].
-#[derive(Debug, Clone)]
-struct FilteredItem {
-    suggestion_idx: usize,
-    score: i64,
-    matching_indices: Vec<usize>,
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FilteredItem {
+    pub suggestion_idx: usize,
+    pub score: i64,
+    pub matching_indices: Vec<usize>,
 }
 
 pub struct ColumnInfo {
@@ -793,8 +800,8 @@ pub struct ActiveSuggestions {
     unprocessed_suggestions: VecDeque<UnprocessedSuggestion>,
     /// Fully post-processed suggestions.  This is the only collection used by
     /// fuzzy matching, rendering, and acceptance logic.
-    processed_suggestions: Vec<ProcessedSuggestion>,
-    filtered_suggestions: Vec<FilteredItem>,
+    pub processed_suggestions: Vec<ProcessedSuggestion>,
+    pub filtered_suggestions: Vec<FilteredItem>,
     /// 2-D position of the currently-selected suggestion within the grid.
     /// `selected_col * last_num_rows_per_col + selected_row` gives the 1-D
     /// index into `filtered_suggestions`.
@@ -832,6 +839,7 @@ impl ActiveSuggestions {
             unprocessed: unprocessed_suggestions,
             common_prefix: _,
             auto_accept_if_solo: _,
+            insert_common_prefix: _,
             comp_type,
         } = builder;
         let sug_len = processed_suggestions.len() + unprocessed_suggestions.len();
@@ -1173,13 +1181,28 @@ impl ActiveSuggestions {
             .strip_prefix(&sug.prefix)
             .unwrap_or(pattern_with_prefix);
 
-        self.fuzzy_matcher
-            .fuzzy_indices(&sug.s, pattern)
-            .map(|(score, indices)| FilteredItem {
+        // Try the fuzzy matcher first
+        if let Some((score, indices)) = self.fuzzy_matcher.fuzzy_indices(&sug.s, pattern) {
+            return Some(FilteredItem {
                 score,
                 suggestion_idx: idx,
                 matching_indices: indices,
-            })
+            });
+        }
+
+        const MAX_PATTERN_LENGTH: usize = 64;
+        // I've noticed that when the pattern is very long, arinae matcher returns None.
+        // So here we force it to return a dummy match.
+        if pattern.len() > MAX_PATTERN_LENGTH {
+            return Some(FilteredItem {
+                score: 0,
+                suggestion_idx: idx,
+                matching_indices: Vec::new(),
+            });
+        }
+
+        // No match: filter this out
+        None
     }
 
     pub fn update_word_under_cursor(&mut self, new_word_under_cursor: &SubString) {
@@ -1197,12 +1220,12 @@ impl ActiveSuggestions {
             self.unprocessed_suggestions.len()
         );
 
-        // Score and filter processed suggestions using the stored matcher.
         self.filtered_suggestions = self
             .processed_suggestions
             .iter()
             .enumerate()
             .filter_map(|(idx, sug)| self.fuzzy_match_for_processed(idx, sug))
+            // .inspect(|x| log::debug!("Fuzzy match result: idx={}, score={}, matching_indices={:?}", x.suggestion_idx, x.score, x.matching_indices))
             .collect();
 
         // Sort by score (descending - higher scores are better matches)

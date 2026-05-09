@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 use std::vec;
 
 use crate::active_suggestions::{
@@ -194,17 +195,20 @@ pub(crate) fn gen_completions_internal(
 ) -> Option<ActiveSuggestionsBuilder> {
     let mut builder = gen_completions_uncomitted(completion_context)?;
 
-    let all_processed = builder.try_process_all();
+    let all_processed = if cfg!(test) {
+        // Tests demand determinism: process everything and always compute
+        // the common prefix even if `insert_common_prefix` is false.
+        while !builder.try_process_all() {}
+        true
+    } else {
+        builder.try_process_all()
+    };
+
     if !all_processed {
         log::debug!("Not all suggestions were fully processed; skipping common prefix calculation");
     }
 
-    if cfg!(test) {
-        // Tests demand determinism: process everything and always compute
-        // the common prefix even if `auto_accept_if_solo` is false.
-        while !builder.try_process_all() {}
-        builder.set_common_prefix();
-    } else if builder.auto_accept_if_solo && all_processed {
+    if builder.insert_common_prefix && all_processed {
         builder.set_common_prefix();
     }
 
@@ -227,7 +231,8 @@ fn gen_completions_uncomitted(
             }
             CompType::FirstWord => {
                 log::debug!("CompType::FirstWord for: {}", word_under_cursor.as_ref());
-                let completions = tab_complete_first_word(word_under_cursor.as_ref());
+                let completions =
+                    tab_complete_first_word(word_under_cursor.as_ref(), word_under_cursor.as_ref());
                 log::debug!(
                     "CompType::FirstWord found {} completions for prefix: {}",
                     completions.len(),
@@ -336,7 +341,9 @@ fn gen_completions_uncomitted(
                             .map(|_score| sug)
                         })
                         .collect();
-                    builder = builder.with_auto_accept_if_solo(false);
+                    builder = builder
+                        .with_auto_accept_if_solo(false)
+                        .with_insert_common_prefix(false);
                     log::debug!(
                         "CompType::FuzzyCommandComp found {} completions for pattern: {}",
                         builder.len(),
@@ -386,8 +393,10 @@ fn gen_completions_uncomitted(
             }
             CompType::GlobExpansion => {
                 log::debug!("CompType::GlobExpansion for {}", word_under_cursor.as_ref());
-                let (completions, comp_res_flags) =
-                    tab_complete_glob_expansion(word_under_cursor.as_ref());
+                let (completions, comp_res_flags) = tab_complete_glob_expansion(
+                    word_under_cursor.as_ref(),
+                    word_under_cursor.as_ref(),
+                );
 
                 log::debug!(
                     "CompType::GlobExpansion found {} completions for pattern: {}",
@@ -455,6 +464,7 @@ fn gen_completions_uncomitted(
                     &(completion_context.word_left_of_cursor().to_string()
                         + "*"
                         + completion_context.word_right_of_cursor()),
+                    word_under_cursor.as_ref(),
                 );
 
                 log::debug!(
@@ -465,6 +475,9 @@ fn gen_completions_uncomitted(
                 if !completions.is_empty() {
                     return Some(
                         ActiveSuggestionsBuilder::from_unprocessed(completions)
+                            .with_insert_common_prefix(
+                                completion_context.word_right_of_cursor().is_empty(),
+                            )
                             .with_comp_type(comp_type.clone()),
                     );
                 }
@@ -475,7 +488,7 @@ fn gen_completions_uncomitted(
                     word_under_cursor.as_ref()
                 );
                 let (completions, _comp_res_flags) =
-                    tab_complete_fuzzy_filename(word_under_cursor.as_ref());
+                    tab_complete_fuzzy_filename(completion_context);
 
                 log::debug!(
                     "CompType::FuzzyFilenameExpansion found {} completions for pattern: {}",
@@ -486,6 +499,7 @@ fn gen_completions_uncomitted(
                     return Some(
                         ActiveSuggestionsBuilder::from_unprocessed(completions)
                             .with_auto_accept_if_solo(false)
+                            .with_insert_common_prefix(false)
                             .with_comp_type(comp_type.clone()),
                     );
                 }
@@ -523,7 +537,7 @@ fn filter_out_non_executables(paths: Vec<UnprocessedSuggestion>) -> Vec<Unproces
         .collect()
 }
 
-fn tab_complete_first_word(command: &str) -> ActiveSuggestionsBuilder {
+fn tab_complete_first_word(command: &str, word_under_cursor: &str) -> ActiveSuggestionsBuilder {
     log::debug!("Generating first word completions for: '{}'", command);
     if command.is_empty() {
         return ActiveSuggestionsBuilder::new();
@@ -531,7 +545,8 @@ fn tab_complete_first_word(command: &str) -> ActiveSuggestionsBuilder {
 
     if command.starts_with('.') || command.contains('/') || command.starts_with('~') {
         // Path to executable
-        let (files, _comp_res_flags) = tab_complete_glob_expansion(&(command.to_string() + "*"));
+        let (files, _comp_res_flags) =
+            tab_complete_glob_expansion(&(command.to_string() + "*"), word_under_cursor);
         let executable_files = filter_out_non_executables(files);
         return ActiveSuggestionsBuilder::from_unprocessed(executable_files);
     }
@@ -560,7 +575,7 @@ fn tab_complete_fuzzy_first_word(command: &str) -> ActiveSuggestionsBuilder {
     }
 
     if command.starts_with('.') || command.contains('/') || command.starts_with('~') {
-        let (fuzzy_files, _comp_res_flags) = tab_complete_fuzzy_filename(command);
+        let (fuzzy_files, _comp_res_flags) = tab_complete_fuzzy_filename_from_word(command);
         let executable_files = filter_out_non_executables(fuzzy_files);
         return ActiveSuggestionsBuilder::from_unprocessed(executable_files);
     }
@@ -594,6 +609,7 @@ fn tab_complete_fuzzy_first_word(command: &str) -> ActiveSuggestionsBuilder {
 fn tab_complete_with_expanded_pattern(
     expanded: &PathPatternExpansion,
     comp_resultflags: bash_funcs::CompletionFlags,
+    wuc: &str,
     should_skip_hidden: bool,
 ) -> Vec<UnprocessedSuggestion> {
     let mut results = Vec::new();
@@ -648,11 +664,7 @@ fn tab_complete_with_expanded_pattern(
                 raw_text: unexpanded,
                 full_path: Some(path),
                 flags: comp_resultflags,
-                // The glob expansion path already preserves the raw prefix in
-                // `unexpanded` via PathPatternExpansion; pass "" here so
-                // into_processed doesn't attempt a second
-                // prefix split (filename_quoting_desired is false anyway).
-                word_under_cursor: String::new(),
+                word_under_cursor: wuc.to_string(),
             });
         }
     }
@@ -663,6 +675,7 @@ fn tab_complete_with_expanded_pattern(
 
 fn tab_complete_glob_expansion(
     pattern: &str,
+    word_under_cursor: &str,
 ) -> (Vec<UnprocessedSuggestion>, bash_funcs::CompletionFlags) {
     let mut comp_resultflags = bash_funcs::CompletionFlags::default();
     // We will handle it ourselves because the prefix should not be quoted but the found filename should be.
@@ -677,7 +690,8 @@ fn tab_complete_glob_expansion(
     log::debug!("found quote type: {:?}", comp_resultflags.quote_type);
 
     let expanded = PathPatternExpansion::new(pattern);
-    let completions = tab_complete_with_expanded_pattern(&expanded, comp_resultflags, true);
+    let completions =
+        tab_complete_with_expanded_pattern(&expanded, comp_resultflags, word_under_cursor, true);
 
     (completions, comp_resultflags)
 }
@@ -688,64 +702,169 @@ fn tab_complete_glob_expansion(
 /// This is the fallback when [`tab_complete_glob_expansion`] (prefix matching)
 /// finds no results: e.g. typing `src/tm` won't prefix-match `src/tab_completion.rs`,
 /// but the fuzzy matcher will.
-fn tab_complete_fuzzy_filename(
+fn tab_complete_fuzzy_filename_from_word(
     word_under_cursor: &str,
 ) -> (Vec<UnprocessedSuggestion>, bash_funcs::CompletionFlags) {
+    tab_complete_fuzzy_filename_impl(word_under_cursor, 0)
+}
+
+fn tab_complete_fuzzy_filename(
+    completion_context: &tab_completion_context::CompletionContext,
+) -> (Vec<UnprocessedSuggestion>, bash_funcs::CompletionFlags) {
+    let cursor_seg_from_right = completion_context
+        .word_right_of_cursor()
+        .matches('/')
+        .count();
+    tab_complete_fuzzy_filename_impl(
+        completion_context.word_under_cursor.as_ref(),
+        cursor_seg_from_right,
+    )
+}
+
+fn tab_complete_fuzzy_filename_impl(
+    word_under_cursor: &str,
+    cursor_seg_from_right: usize,
+) -> (Vec<UnprocessedSuggestion>, bash_funcs::CompletionFlags) {
     let mut comp_res_flags = bash_funcs::CompletionFlags::default();
-    // Split at the last '/' to separate the directory prefix from the filename
-    // fragment that will be used as the fuzzy-match pattern.
+    comp_res_flags.filename_quoting_desired = false;
+    comp_res_flags.filename_completion_desired = true;
+    comp_res_flags.quote_type = bash_funcs::find_quote_type(word_under_cursor);
 
-    let (dir_glob_pattern, filename_fragment) =
-        if let Some(slash_pos) = word_under_cursor.rfind('/') {
-            (
-                word_under_cursor[..slash_pos + 1].to_string() + "*",
-                word_under_cursor[slash_pos + 1..].to_string(),
-            )
-        } else {
-            ("*".to_string(), word_under_cursor.to_string())
-        };
-
-    // Nothing to fuzzy-match against — let the caller fall through.
-    if filename_fragment.is_empty() {
+    let dequoted_wuc = bash_funcs::dequoting_function_rust(word_under_cursor);
+    let (is_absolute, segments) = split_nonempty_path_segments(&dequoted_wuc);
+    if segments.is_empty() {
         return (vec![], comp_res_flags);
     }
 
-    // Set up flags for glob expansion
-    comp_res_flags.filename_quoting_desired = false;
-    comp_res_flags.filename_completion_desired = true;
-    comp_res_flags.quote_type = bash_funcs::find_quote_type(&dir_glob_pattern);
+    let cursor_seg_idx = segments
+        .len()
+        .saturating_sub(cursor_seg_from_right.saturating_add(1));
+    let (prefix_segments, fuzzy_segments) = segments.split_at(cursor_seg_idx);
+    if fuzzy_segments.is_empty() {
+        return (vec![], comp_res_flags);
+    }
 
-    let expanded = PathPatternExpansion::new(&dir_glob_pattern);
-    let all_files = tab_complete_with_expanded_pattern(&expanded, comp_res_flags, false);
+    let base_input = path_from_segments(is_absolute, prefix_segments);
+    let expanded_base = PathBuf::from(bash_funcs::fully_expand_path(if base_input.is_empty() {
+        "."
+    } else {
+        &base_input
+    }));
+    let raw_prefix = path_prefix_for_output(is_absolute, prefix_segments);
 
     let matcher = ArinaeMatcher::new(skim::CaseMatching::Smart, true);
+    let mut scored = fuzzy_glob_recursive(&expanded_base, fuzzy_segments, &matcher);
+    if scored.is_empty() {
+        return (vec![], comp_res_flags);
+    }
 
-    // glob expansion handles dequoting the pattern, so we only need to dequote
-    let dequoted_fragment = bash_funcs::dequoting_function_rust(&filename_fragment);
+    scored.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+    scored.dedup_by(|a, b| a.1 == b.1);
 
-    let mut scored: Vec<(i64, UnprocessedSuggestion)> = all_files
+    let completions = scored
         .into_iter()
-        .filter_map(|sug| {
-            // Match only against the last path segment so that e.g. the
-            // directory prefix doesn't inflate the score.
-            let match_text = sug.match_text();
-            let filename = match_text.rsplit('/').next().unwrap_or(match_text);
-            content_utils::fuzzy_match_with_threshold(
-                &matcher,
-                filename,
-                &dequoted_fragment,
-                content_utils::FuzzyMatchThreshold::Medium,
-            )
-            .map(|score| (score, sug))
+        .map(|(_score, matched_segments, final_path)| {
+            let mut raw_text = raw_prefix.clone();
+            raw_text.push_str(&matched_segments.join("/"));
+
+            UnprocessedSuggestion {
+                raw_text,
+                full_path: Some(final_path),
+                flags: comp_res_flags,
+                word_under_cursor: String::new(),
+            }
         })
         .collect();
 
-    // Best matches first.
-    scored.sort_by(|a, b| b.0.cmp(&a.0));
-    scored.dedup_by(|a, b| a.1.match_text() == b.1.match_text());
-    let completions = scored.into_iter().map(|(_, sug)| sug).collect();
-
     (completions, comp_res_flags)
+}
+
+fn split_nonempty_path_segments(path: &str) -> (bool, Vec<String>) {
+    let is_absolute = path.starts_with('/');
+    let segments = path
+        .split('/')
+        .filter(|seg| !seg.is_empty())
+        .map(ToString::to_string)
+        .collect();
+    (is_absolute, segments)
+}
+
+fn path_from_segments(is_absolute: bool, segments: &[String]) -> String {
+    if segments.is_empty() {
+        if is_absolute {
+            "/".to_string()
+        } else {
+            String::new()
+        }
+    } else {
+        let mut out = String::new();
+        if is_absolute {
+            out.push('/');
+        }
+        out.push_str(&segments.join("/"));
+        out
+    }
+}
+
+fn path_prefix_for_output(is_absolute: bool, segments: &[String]) -> String {
+    let mut out = path_from_segments(is_absolute, segments);
+    if !out.is_empty() && !out.ends_with('/') {
+        out.push('/');
+    }
+    out
+}
+
+fn fuzzy_glob_recursive(
+    base_dir: &Path,
+    remaining_segments: &[String],
+    matcher: &ArinaeMatcher,
+) -> Vec<(i64, Vec<String>, PathBuf)> {
+    if remaining_segments.is_empty() {
+        return vec![(0, vec![], base_dir.to_path_buf())];
+    }
+
+    let mut out = Vec::new();
+    let pattern = &remaining_segments[0];
+    let is_last = remaining_segments.len() == 1;
+
+    let Ok(entries) = std::fs::read_dir(base_dir) else {
+        return out;
+    };
+
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        let Some(score) = content_utils::fuzzy_match_with_threshold(
+            matcher,
+            &name,
+            pattern,
+            content_utils::FuzzyMatchThreshold::Medium,
+        ) else {
+            continue;
+        };
+
+        let path = entry.path();
+        let file_type = entry.file_type().ok();
+
+        if is_last {
+            out.push((score, vec![name], path));
+            continue;
+        }
+
+        if !file_type.is_some_and(|ft| ft.is_dir()) {
+            continue;
+        }
+
+        for (child_score, child_segments, final_path) in
+            fuzzy_glob_recursive(&path, &remaining_segments[1..], matcher)
+        {
+            let mut segments = Vec::with_capacity(1 + child_segments.len());
+            segments.push(name.clone());
+            segments.extend(child_segments);
+            out.push((score + child_score, segments, final_path));
+        }
+    }
+
+    out
 }
 
 fn tab_complete_tilde_expansion(pattern: &str) -> Vec<ProcessedSuggestion> {
@@ -944,7 +1063,7 @@ impl App<'_> {
 #[cfg(test)]
 mod tab_completion_tests {
     use super::*;
-    use crate::active_suggestions::ProcessedSuggestion;
+    use crate::active_suggestions::{FilteredItem, ProcessedSuggestion};
     use crate::tab_completion_context::{CompletionContext, get_completion_context};
     use crate::text_buffer::TextBuffer;
     use rusty_fork::rusty_fork_test;
@@ -1008,6 +1127,20 @@ mod tab_completion_tests {
         suggestions
     }
 
+    fn run_to_active_suggestions(buffer: &mut TextBuffer) -> ActiveSuggestions {
+        crate::logging::init_for_tests_once();
+
+        let (builder, comp_context) = get_builder_from_buffer(buffer).unwrap();
+        let outcome =
+            apply_tab_complete_to_buffer(buffer, &builder, &comp_context.word_under_cursor);
+        let final_wuc = if let TabCompleteBufferOutcome::Pending { final_wuc } = outcome {
+            final_wuc
+        } else {
+            panic!("Expected pending outcome with suggestions");
+        };
+        ActiveSuggestions::new(builder, final_wuc, std::time::Duration::from_secs(0))
+    }
+
     fn assert_completions(command: &str, expected: &[ProcessedSuggestion]) {
         let actual = run_completion(command);
         assert_processed(&actual, expected);
@@ -1049,6 +1182,16 @@ mod tab_completion_tests {
 
     fn cd_to_example_glob_fs() {
         let dir = find_test_fixture_dir("example_glob_fs");
+        std::env::set_current_dir(&dir).unwrap_or_else(|e| panic!("cd {dir}: {e}"));
+    }
+
+    fn cd_to_example_fuzzy_glob_fs() {
+        let dir = find_test_fixture_dir("example_fuzzy_glob_fs");
+        std::env::set_current_dir(&dir).unwrap_or_else(|e| panic!("cd {dir}: {e}"));
+    }
+
+    fn cd_to_example_long_filenames_fs() {
+        let dir = find_test_fixture_dir("example_long_filenames_fs");
         std::env::set_current_dir(&dir).unwrap_or_else(|e| panic!("cd {dir}: {e}"));
     }
 
@@ -1098,15 +1241,12 @@ mod tab_completion_tests {
         #[test]
         fn git_diff_dashdash_lists_long_flags_mid_word() {
             cd_to_example_fs();
-            let mut buffer = TextBuffer::new("git diff --stag");
+            let buffer = TextBuffer::new_with_cursor("git diff --st█ag");
 
             // It doesnt matter where the cursor is because I always move it to the end
             // This gives best results since it allows the FuzzyCommandComp and Filname (that uses mid word information)
             // to run.
 
-            buffer.move_to_end(); // --stag|
-            buffer.move_left();   // --sta|g
-            buffer.move_left();   // --st|ag
             let actual = run_completion_from_buffer(&buffer);
             let names: Vec<&str> = actual.iter().map(|s| s.s.as_str()).collect();
             for flag in ["--staged"] {
@@ -1115,7 +1255,7 @@ mod tab_completion_tests {
 
             // If we didnt move the cursor to the end,
             // we would get the same results as this one:
-            let buffer = TextBuffer::new("git diff --st");
+            let buffer = TextBuffer::new_with_cursor("git diff --st█");
             let actual = run_completion_from_buffer(&buffer);
             let names: Vec<&str> = actual.iter().map(|s| s.s.as_str()).collect();
             for flag in ["--staged", "--stat"] {
@@ -1176,12 +1316,12 @@ mod tab_completion_tests {
             assert_completions(
                 "mycmd ./",
                 &[
-                    ProcessedSuggestion::new("./abc/", "", ""),
-                    ProcessedSuggestion::new("./bar.txt", "", " "),
-                    ProcessedSuggestion::new(r"./file\ with\ spaces.txt", "", " "),
-                    ProcessedSuggestion::new("./foo/", "", ""),
-                    ProcessedSuggestion::new(r"./many\ spaces\ here/", "", ""),
-                    ProcessedSuggestion::new("./sym_link_to_foo/", "", ""),
+                    ProcessedSuggestion::new("abc/", "./", ""),
+                    ProcessedSuggestion::new("bar.txt", "./", " "),
+                    ProcessedSuggestion::new(r"file\ with\ spaces.txt", "./", " "),
+                    ProcessedSuggestion::new("foo/", "./", ""),
+                    ProcessedSuggestion::new(r"many\ spaces\ here/", "./", ""),
+                    ProcessedSuggestion::new("sym_link_to_foo/", "./", ""),
                 ],
             );
         }
@@ -1231,16 +1371,25 @@ mod tab_completion_tests {
             );
         }
 
+        #[test]
+        fn fuzzy_globbing_recurses_across_path_segments() {
+            cd_to_example_fuzzy_glob_fs();
+
+            let buffer = TextBuffer::new_with_cursor("mycmd ./tr█e/lefa/apel");
+
+            let builder = get_builder_from_buffer(&buffer).unwrap().0;
+            assert_eq!(builder.comp_type, CompType::FuzzyFilenameExpansion);
+
+            let names: Vec<&str> = builder.processed.iter().map(|s| s.s.as_str()).collect();
+            assert!(names.contains(&"./tree/leaf/apple.txt"));
+            assert!(names.contains(&"./three/leaf/apple.log"));
+        }
+
 
         #[test]
         fn mid_word_completion() {
             cd_to_example_fs();
-            let mut buffer = TextBuffer::new("mycmd ./abc/f/baz");
-            buffer.move_left();
-            buffer.move_left();
-            buffer.move_left();
-            buffer.move_left(); // cursor is now right after f
-
+            let mut buffer = TextBuffer::new_with_cursor("mycmd ./abc/f█/baz");
 
             let (builder, comp_context) = get_builder_from_buffer(&buffer).unwrap();
             assert_eq!(builder.comp_type, CompType::FilenameExpansion);
@@ -1261,13 +1410,7 @@ mod tab_completion_tests {
         #[test]
         fn mid_word_completion_multiple() {
             cd_to_example_braces_fs();
-            let mut buffer = TextBuffer::new("mycmd ./fo/barA");
-            buffer.move_left();
-            buffer.move_left();
-            buffer.move_left();
-            buffer.move_left();
-            buffer.move_left(); // cursor is now right after f
-
+            let mut buffer = TextBuffer::new_with_cursor("mycmd ./fo█/barA");
 
             let (builder, comp_context) = get_builder_from_buffer(&buffer).unwrap();
             assert_eq!(builder.comp_type, CompType::FilenameExpansion);
@@ -1290,37 +1433,53 @@ mod tab_completion_tests {
 
             let outcome = apply_tab_complete_to_buffer(&mut buffer, &builder, &comp_context.word_under_cursor);
             log::info!("Outcome of applying tab complete: {:?}", &outcome);
-            assert!(matches!(outcome, TabCompleteBufferOutcome::Pending { ref final_wuc } if final_wuc.as_ref() == "./foo"));
-            assert_eq!(buffer.buffer(), "mycmd ./foo");
+            assert!(matches!(outcome, TabCompleteBufferOutcome::Pending { ref final_wuc } if final_wuc.as_ref() == "./fo/barA"));
+            assert_eq!(buffer.buffer(), "mycmd ./fo/barA");
         }
 
-        // #[test]
-        // fn mid_word_completion_naive_bash_default() {
-        //     cd_to_example_fs();
-        //     // Cat is setup so that run_programmable_completions in test fixtures
-        //     // returns files matching the lhs of
-        //     let mut buffer = TextBuffer::new("cat ./abc/f/baz");
-        //     buffer.move_left();
-        //     buffer.move_left();
-        //     buffer.move_left();
-        //     buffer.move_left(); // cursor is now right after f
+        #[test]
+        fn mid_word_completion_naive_bash_default() {
+            cd_to_example_fs();
+            // Cat is setup so that run_programmable_completions in test fixtures
+            // returns files matching the lhs of
+
+            // We move the cursor to the end so this acts like "./abc/foo/ba█"
+            // Which a naive glob will complete
+            let mut buffer = TextBuffer::new_with_cursor("cat ./abc/foo█/ba");
+
+            let (builder, comp_context) = get_builder_from_buffer(&buffer).unwrap();
+            assert_eq!(builder.comp_type, CompType::CommandComp { command_word: "cat".to_string() });
+            assert_processed(
+                &builder.processed,
+                &[ProcessedSuggestion::new(
+                    "./abc/foo/baz",
+                    "",
+                    " ",
+                )],
+            );
+            let outcome = apply_tab_complete_to_buffer(&mut buffer, &builder, &comp_context.word_under_cursor);
+            assert!(matches!(outcome, TabCompleteBufferOutcome::SoloAccepted));
+            assert_eq!(buffer.buffer(), "cat ./abc/foo/baz ");
 
 
-        //     let (builder, comp_context) = get_builder_from_buffer(&buffer).unwrap();
-        //     assert_eq!(builder.comp_type, CompType::FilenameExpansion);
-        //     assert_processed(
-        //         &builder.processed,
-        //         &[ProcessedSuggestion::new(
-        //             "./abc/foo/baz",
-        //             "",
-        //             " ",
-        //         )],
-        //     );
+            // But now since fo folder doesnt exit (only 'foo' does)
+            // command comp should fail we fall back to fuzzy filename
+            let mut buffer = TextBuffer::new_with_cursor("cat ./abc/fo█/ba");
 
-        //     let outcome = apply_tab_complete_to_buffer(&mut buffer, &builder, &comp_context.word_under_cursor);
-        //     assert!(matches!(outcome, TabCompleteBufferOutcome::SoloAccepted));
-        //     assert_eq!(buffer.buffer(), "casdfat ./abc/foo/baz ");
-        // }
+            let (builder, comp_context) = get_builder_from_buffer(&buffer).unwrap();
+            assert_eq!(builder.comp_type, CompType::FuzzyFilenameExpansion);
+            assert_processed(
+                &builder.processed,
+                &[ProcessedSuggestion::new(
+                    "./abc/foo/baz",
+                    "",
+                    " ",
+                )],
+            );
+            let outcome = apply_tab_complete_to_buffer(&mut buffer, &builder, &comp_context.word_under_cursor);
+            assert!(matches!(outcome, TabCompleteBufferOutcome::Pending { ref final_wuc } if final_wuc.as_ref() == "./abc/fo/ba"));
+            assert_eq!(buffer.buffer(), "cat ./abc/fo/ba");
+        }
 
 
 
@@ -1352,6 +1511,79 @@ mod tab_completion_tests {
             let outcome = apply_tab_complete_to_buffer(&mut buffer, &builder, &comp_context.word_under_cursor);
             assert!(matches!(outcome, TabCompleteBufferOutcome::Pending { .. }));
             assert_eq!(buffer.buffer(), "mycmd foo");
+        }
+
+        // ------- fuzzy matching with long filenames -----------
+
+        #[test]
+        fn fuzzy_matching_with_long_filenames() {
+            cd_to_example_long_filenames_fs();
+
+            // Arinae fuzzy matcher stops working at a certain length 64 chars.
+            // So below that, we can expect fuzzy matching to work.
+            let mut buffer = TextBuffer::new_with_cursor("mycmd ./len_61_plus_3/█");
+            let active_suggestions = run_to_active_suggestions(&mut buffer);
+            assert_eq!(buffer.buffer(), "mycmd ./len_61_plus_3/abcd_abcd_abcd_abcd_abcd_abcd_abcd_abcd_abcd_abcd_abcd_abcd_a");
+            assert_processed(
+                &active_suggestions.processed_suggestions,
+                &[
+                    ProcessedSuggestion::new(
+                        "abcd_abcd_abcd_abcd_abcd_abcd_abcd_abcd_abcd_abcd_abcd_abcd_aBAR",
+                        "./len_61_plus_3/",
+                        " ",
+                    ),
+                    ProcessedSuggestion::new(
+                        "abcd_abcd_abcd_abcd_abcd_abcd_abcd_abcd_abcd_abcd_abcd_abcd_aFOO",
+                        "./len_61_plus_3/",
+                        " ",
+                    ),
+                ],
+            );
+            assert_eq!(active_suggestions.filtered_suggestions, vec![
+                FilteredItem{
+                    suggestion_idx: 0,
+                    score: 2006,
+                    matching_indices: (0..=60).collect(),
+                },
+                FilteredItem{
+                    suggestion_idx: 1,
+                    score: 2006,
+                    matching_indices: (0..=60).collect(),
+                }
+            ]);
+
+            // But above that length, fuzzy filtering in active suggestions should just return dummy scores
+            let mut buffer = TextBuffer::new_with_cursor("mycmd ./len_65_plus_3/█");
+            let active_suggestions = run_to_active_suggestions(&mut buffer);
+            assert_eq!(buffer.buffer(), "mycmd ./len_65_plus_3/abcd_abcd_abcd_abcd_abcd_abcd_abcd_abcd_abcd_abcd_abcd_abcd_abcd_");
+            assert_processed(
+                &active_suggestions.processed_suggestions,
+                &[
+                    ProcessedSuggestion::new(
+                        "abcd_abcd_abcd_abcd_abcd_abcd_abcd_abcd_abcd_abcd_abcd_abcd_abcd_BAR",
+                        "./len_65_plus_3/",
+                        " ",
+                    ),
+                    ProcessedSuggestion::new(
+                        "abcd_abcd_abcd_abcd_abcd_abcd_abcd_abcd_abcd_abcd_abcd_abcd_abcd_FOO",
+                        "./len_65_plus_3/",
+                        " ",
+                    ),
+                ],
+            );
+            assert_eq!(active_suggestions.filtered_suggestions, vec![
+                FilteredItem{
+                    suggestion_idx: 0,
+                    score: 0,
+                    matching_indices: vec![],
+                },
+                FilteredItem{
+                    suggestion_idx: 1,
+                    score: 0,
+                    matching_indices: vec![],
+                }
+            ]);
+
         }
     }
 }
