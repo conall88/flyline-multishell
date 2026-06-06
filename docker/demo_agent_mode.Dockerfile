@@ -1,9 +1,9 @@
-FROM demo-base AS svg-builder
+FROM demo-base AS demo-builder
 
 COPY tapes/demo_agent_mode.tape .
 
 RUN faketime @1771881894 /home/john/bin/evp demo_agent_mode.tape
 
 FROM scratch
-COPY --from=svg-builder /app/*.svg /
-COPY --from=svg-builder /home/john/*log  /
+COPY --from=demo-builder /app/*.gif /
+COPY --from=demo-builder /home/john/*log  /

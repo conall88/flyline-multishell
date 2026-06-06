@@ -1,4 +1,4 @@
-FROM demo-base AS svg-builder
+FROM demo-base AS demo-builder
 
 # Create a demo filesystem with directories, regular files, a valid symlink to a
 # directory, and a broken symlink (pointing to a non-existent target).
@@ -25,5 +25,5 @@ COPY tapes/demo_ls_colors.tape .
 RUN faketime @1771881894 /home/john/bin/evp demo_ls_colors.tape
 
 FROM scratch
-COPY --from=svg-builder /app/*.svg  /
-COPY --from=svg-builder /home/john/*log  /
+COPY --from=demo-builder /app/*.gif  /
+COPY --from=demo-builder /home/john/*log  /

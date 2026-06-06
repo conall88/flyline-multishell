@@ -6,19 +6,15 @@ on:
   workflow_dispatch:
 
 concurrency:
-  group: generate-demos
+  group: generate-gif
   cancel-in-progress: true
 
-# Upgraded permissions to allow GitHub Actions to deploy to Pages
-permissions:
-  contents: read
-  pages: write
-  id-token: write
-
 jobs:
-  generate-demos:
-    name: Generate demo assets
+  generate-gif:
+    name: Generate demo GIF
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - name: Checkout master branch
         uses: actions/checkout@v6
@@ -26,7 +22,7 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
 
-      - name: Build demo assets
+      - name: Build demo GIFs
         uses: docker/bake-action@v7
         with:
           files: docker-bake.hcl
@@ -36,19 +32,9 @@ jobs:
             *.cache-from=type=gha
             *.cache-to=type=gha,mode=max
 
-      # Step 1: Stage the demo files into a dedicated deployment directory
-      - name: Stage assets for Pages
+      - name: Upload GIFs to assets release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          mkdir -p public-pages
-          cp *.svg public-pages/
-
-      # Step 2: Bundle and upload the folder to GitHub's Pages infrastructure
-      - name: Upload demo assets to Pages
-        uses: actions/upload-pages-artifact@v3
-        with:
-          path: 'public-pages'
-
-      # Step 3: Trigger the live, zero-commit web deployment
-      - name: Deploy to GitHub Pages
-        id: deployment
-        uses: actions/deploy-pages@v4
+          gh release create assets --title "assets" --notes "Demo GIF storage" 2>/dev/null || true
+          gh release upload assets *.gif --clobber

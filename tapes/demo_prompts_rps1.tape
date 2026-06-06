@@ -1,5 +1,5 @@
 # Where should we write the GIF?
-Output demo_prompts_rps1.svg
+Output demo_prompts_rps1.gif
 
 Source demo_settings.tape
 Set Height 400

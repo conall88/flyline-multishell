@@ -1,5 +1,5 @@
 # Where should we write the GIF?
-Output demo_inline_history.svg
+Output demo_inline_history.gif
 
 Source demo_settings.tape
 Set Height 300

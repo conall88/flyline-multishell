@@ -1,5 +1,5 @@
 # Where should we write the GIF?
-Output demo_prompts_ps1_fill.svg
+Output demo_prompts_ps1_fill.gif
 
 
 Source demo_settings.tape

@@ -1,5 +1,5 @@
 # Where should we write the GIF?
-Output demo_tab_completion_easing.svg
+Output demo_tab_completion_easing.gif
 
 Source demo_settings.tape
 Set Height 500

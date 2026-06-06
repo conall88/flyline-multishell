@@ -1,5 +1,5 @@
 # Where should we write the GIF?
-Output demo_fuzzy_history.svg
+Output demo_fuzzy_history.gif
 
 Source demo_settings.tape
 Source demo_setup.tape

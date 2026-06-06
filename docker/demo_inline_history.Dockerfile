@@ -1,4 +1,4 @@
-FROM demo-base AS svg-builder
+FROM demo-base AS demo-builder
 
 # Start with an empty history so the demo is deterministic.
 RUN : > /home/john/.bash_history && \
@@ -11,4 +11,4 @@ COPY tapes/demo_inline_history.tape .
 RUN faketime @1771881894 /home/john/bin/evp demo_inline_history.tape
 
 FROM scratch
-COPY --from=svg-builder /app/*.svg /
+COPY --from=demo-builder /app/*.gif /

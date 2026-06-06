@@ -1,4 +1,4 @@
-FROM demo-base AS svg-builder
+FROM demo-base AS demo-builder
 
 # Override PS1 with a minimal prompt for the demo
 RUN printf '%s\n' \
@@ -14,4 +14,4 @@ COPY tapes/demo_fuzzy_history.tape .
 RUN faketime @1771881894 /home/john/bin/evp demo_fuzzy_history.tape
 
 FROM scratch
-COPY --from=svg-builder /app/*.svg /
+COPY --from=demo-builder /app/*.gif /

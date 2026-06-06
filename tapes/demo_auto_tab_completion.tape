@@ -1,4 +1,4 @@
-Output demo_auto_tab_completion.svg
+Output demo_auto_tab_completion.gif
 
 Source demo_settings.tape
 Set Height 600
@@ -11,27 +11,19 @@ Enter
 Show
 
 
-Type "flyli"
+Type "gre"
+Sleep 600ms
+Tab
+Enter
+Sleep 900ms
+
+Type "--"
+Sleep 600ms
+
+Type `matches`
+Sleep 600ms
 Tab
 Sleep 600ms
 Enter
 Sleep 900ms
 
-Type "set-st"
-Tab
-Sleep 600ms
-Enter
-Sleep 900ms
-
-Type `bas`
-Tab
-Sleep 600ms
-Enter
-Sleep 900ms
-
-Type "red"
-Sleep 800ms
-Escape
-Sleep 400ms
-Enter
-Sleep 1000ms
