@@ -69,24 +69,76 @@ where
 }
 
 #[derive(Debug, PartialEq, Eq, Hash, Clone)]
-pub enum CommandType {
-    Unknown,
-    Alias,
-    Keyword,
-    Function,
-    Builtin,
-    File,
+pub enum CommandWordInfo {
+    Unknown {
+        command: String,
+    },
+    Alias {
+        command: String,
+        expansion: String,
+    },
+    Keyword {
+        command: String,
+        usage: Option<String>,
+    },
+    Function {
+        command: String,
+        source_file: Option<String>,
+        line: Option<i32>,
+    },
+    Builtin {
+        command: String,
+        usage: Option<String>,
+    },
+    File {
+        command: String,
+        path: String,
+    },
 }
 
-impl CommandType {
-    pub fn from_str(s: &str) -> CommandType {
-        match s {
-            "alias" => CommandType::Alias,
-            "keyword" => CommandType::Keyword,
-            "function" => CommandType::Function,
-            "builtin" => CommandType::Builtin,
-            "file" => CommandType::File,
-            _ => CommandType::Unknown,
+impl CommandWordInfo {
+    pub fn is_known(&self) -> bool {
+        !matches!(self, CommandWordInfo::Unknown { .. })
+    }
+
+    pub fn command(&self) -> &str {
+        match self {
+            CommandWordInfo::Unknown { command } => command,
+            CommandWordInfo::Alias { command, .. } => command,
+            CommandWordInfo::Keyword { command, .. } => command,
+            CommandWordInfo::Function { command, .. } => command,
+            CommandWordInfo::Builtin { command, .. } => command,
+            CommandWordInfo::File { command, .. } => command,
+        }
+    }
+
+    pub fn to_description(&self) -> String {
+        match self {
+            CommandWordInfo::Unknown { .. } => "unknown".to_string(),
+            CommandWordInfo::Alias { expansion, .. } => format!("alias: {}", expansion),
+            CommandWordInfo::Keyword { command, usage } => {
+                if let Some(u) = usage {
+                    format!("keyword: {}", u)
+                } else {
+                    format!("keyword: {}", command)
+                }
+            }
+            CommandWordInfo::Builtin { command, usage } => {
+                if let Some(u) = usage {
+                    format!("builtin: {}", u)
+                } else {
+                    format!("builtin: {}", command)
+                }
+            }
+            CommandWordInfo::File { path, .. } => format!("file: {}", path),
+            CommandWordInfo::Function {
+                source_file, line, ..
+            } => match (source_file, line) {
+                (Some(file), Some(l)) => format!("function {}:{}", file, l),
+                (Some(file), None) => format!("function {}", file),
+                (None, Some(l)) => format!("function :{}", l),
+                (None, None) => "function".to_string(),
+            },
         }
     }
 }
@@ -116,7 +168,7 @@ pub fn find_alias(cmd: &str) -> Option<String> {
 }
 
 #[cfg(not(test))]
-fn get_command_type_uncached(cmd: &str) -> (CommandType, String) {
+fn get_command_info_uncached(cmd: &str) -> CommandWordInfo {
     // If the command word looks like a filename (contains '/' or starts with
     // '~'), expand it first so that tilde and variable expansion are resolved
     // before the lookup.
@@ -134,94 +186,138 @@ fn get_command_type_uncached(cmd: &str) -> (CommandType, String) {
     let (_, command_type_output) = with_redirected_stdout(|| unsafe {
         bash_symbols::describe_command(cmd_c_str.as_ptr(), bash_symbols::CDescFlag::Type as c_int)
     });
-    let command_type = CommandType::from_str(command_type_output.trim());
+    let command_type_str = command_type_output.trim();
 
-    let (_, short_desc) = match command_type {
-        CommandType::Alias => {
-            let (result, output) = with_redirected_stdout(|| unsafe {
+    match command_type_str {
+        "alias" => {
+            let expansion = find_alias(cmd).unwrap_or_else(|| cmd.to_string());
+            CommandWordInfo::Alias {
+                command: cmd.to_string(),
+                expansion,
+            }
+        }
+        "keyword" => {
+            let (_, output) = with_redirected_stdout(|| unsafe {
                 bash_symbols::describe_command(
                     cmd_c_str.as_ptr(),
                     bash_symbols::CDescFlag::ShortDesc as c_int,
                 )
             });
-            let extracted = if let Some(start) = output.find('`') {
-                if let Some(end) = output.rfind('\'') {
-                    output[start + 1..end].to_string()
-                } else {
-                    output
-                }
+            let usage = if output.is_empty() {
+                None
             } else {
-                output
+                Some(output.trim().to_string())
             };
-            (result, format!("alias: {}", extracted))
+            CommandWordInfo::Keyword {
+                command: cmd.to_string(),
+                usage,
+            }
         }
-        CommandType::Builtin | CommandType::Keyword => {
-            let (result, output) = with_redirected_stdout(|| unsafe {
+        "builtin" => {
+            let (_, output) = with_redirected_stdout(|| unsafe {
                 bash_symbols::describe_command(
                     cmd_c_str.as_ptr(),
                     bash_symbols::CDescFlag::ShortDesc as c_int,
                 )
             });
-
-            (
-                result,
-                format!("{}: {}", command_type_output.trim(), output.trim()),
-            )
+            let usage = if output.is_empty() {
+                None
+            } else {
+                Some(output.trim().to_string())
+            };
+            CommandWordInfo::Builtin {
+                command: cmd.to_string(),
+                usage,
+            }
         }
-        CommandType::File => {
-            let (result, output) = with_redirected_stdout(|| unsafe {
+        "file" => {
+            let (_, output) = with_redirected_stdout(|| unsafe {
                 bash_symbols::describe_command(
                     cmd_c_str.as_ptr(),
                     bash_symbols::CDescFlag::PathOnly as c_int,
                 )
             });
-
-            (result, format!("file: {}", output.trim()))
+            CommandWordInfo::File {
+                command: cmd.to_string(),
+                path: output.trim().to_string(),
+            }
         }
-        CommandType::Function => {
-            (0, "function".to_string()) // For functions, we currently don't extract a short description
-        }
-        CommandType::Unknown => {
-            // If unknown, no short description
-            (0, "unknown".to_string())
-        }
-    };
-
-    (command_type, short_desc)
+        "function" => unsafe {
+            let func_def_ptr = bash_symbols::find_function_def(cmd_c_str.as_ptr());
+            if !func_def_ptr.is_null() {
+                let func_def = &*func_def_ptr;
+                let line = if func_def.line > 0 {
+                    Some(func_def.line)
+                } else {
+                    None
+                };
+                let source_file = if func_def.source_file.is_null() {
+                    None
+                } else {
+                    std::ffi::CStr::from_ptr(func_def.source_file)
+                        .to_str()
+                        .ok()
+                        .map(|s| s.to_string())
+                };
+                CommandWordInfo::Function {
+                    command: cmd.to_string(),
+                    source_file,
+                    line,
+                }
+            } else {
+                CommandWordInfo::Function {
+                    command: cmd.to_string(),
+                    source_file: None,
+                    line: None,
+                }
+            }
+        },
+        _ => CommandWordInfo::Unknown {
+            command: cmd.to_string(),
+        },
+    }
 }
 
-static CALL_TYPE_CACHE: Mutex<Option<HashMap<String, (CommandType, String)>>> = Mutex::new(None);
+static CALL_TYPE_CACHE: Mutex<Option<HashMap<String, CommandWordInfo>>> = Mutex::new(None);
 
 #[cfg(not(test))]
-pub fn get_command_info(cmd: &str) -> (CommandType, String) {
+pub fn get_command_info(cmd: &str) -> CommandWordInfo {
     let mut cache_guard = CALL_TYPE_CACHE.lock().unwrap();
     let cache = cache_guard.get_or_insert_with(HashMap::new);
 
     if let Some(res) = cache.get(cmd) {
         res.clone()
     } else {
-        let result = get_command_type_uncached(cmd);
+        let result = get_command_info_uncached(cmd);
         cache.insert(cmd.to_string(), result.clone());
         result
     }
 }
 
 #[cfg(test)]
-pub fn get_command_info(cmd: &str) -> (CommandType, String) {
+pub fn get_command_info(cmd: &str) -> CommandWordInfo {
     // The test environment models a tiny world: `git` is the only "real"
     // executable on PATH, so it gets reported as a File at /usr/bin/git.
     // Everything else is unknown — tests that need additional command types
     // can extend this match arm.
     if cmd == "git" {
-        return (CommandType::File, "file: /usr/bin/git".to_string());
+        return CommandWordInfo::File {
+            command: "git".to_string(),
+            path: "/usr/bin/git".to_string(),
+        };
     }
-    if test_fixtures::test_aliases()
+    if let Some(expansion) = test_fixtures::test_aliases()
         .iter()
-        .any(|(name, _)| *name == cmd)
+        .find_map(|(name, value)| (*name == cmd).then(|| (*value).to_string()))
     {
-        return (CommandType::Alias, format!("alias: {cmd}"));
+        return CommandWordInfo::Alias {
+            command: cmd.to_string(),
+            expansion,
+        };
     }
-    (CommandType::Unknown, "unknown".to_string())
+    CommandWordInfo::Unknown {
+        command: cmd.to_string(),
+    }
 }
 
 #[cfg(not(test))]
@@ -1303,33 +1399,103 @@ pub fn find_quote_type(s: &str) -> Option<QuoteType> {
 // Cached environment lookups (moved from BashEnvManager)
 // ---------------------------------------------------------------------------
 
-static DEFINED_ALIASES: Mutex<Option<Vec<String>>> = Mutex::new(None);
-static DEFINED_RESERVED_WORDS: Mutex<Option<Vec<String>>> = Mutex::new(None);
-static DEFINED_SHELL_FUNCTIONS: Mutex<Option<Vec<String>>> = Mutex::new(None);
-static DEFINED_BUILTINS: Mutex<Option<Vec<String>>> = Mutex::new(None);
+static DEFINED_ALIASES: Mutex<Option<Vec<CommandWordInfo>>> = Mutex::new(None);
+static DEFINED_RESERVED_WORDS: Mutex<Option<Vec<CommandWordInfo>>> = Mutex::new(None);
+static DEFINED_SHELL_FUNCTIONS: Mutex<Option<Vec<CommandWordInfo>>> = Mutex::new(None);
+static DEFINED_BUILTINS: Mutex<Option<Vec<CommandWordInfo>>> = Mutex::new(None);
 
 #[cfg(not(test))]
-fn get_cached_aliases() -> Vec<String> {
+fn get_cached_aliases() -> Vec<CommandWordInfo> {
     let mut guard = DEFINED_ALIASES.lock().unwrap();
-    guard.get_or_insert_with(get_all_aliases).clone()
+    guard
+        .get_or_insert_with(|| {
+            get_all_aliases()
+                .into_iter()
+                .map(|name| {
+                    let expansion = find_alias(&name).unwrap_or_else(|| name.clone());
+                    CommandWordInfo::Alias {
+                        command: name,
+                        expansion,
+                    }
+                })
+                .collect()
+        })
+        .clone()
 }
 
 #[cfg(not(test))]
-fn get_cached_reserved_words() -> Vec<String> {
+fn get_cached_reserved_words() -> Vec<CommandWordInfo> {
     let mut guard = DEFINED_RESERVED_WORDS.lock().unwrap();
-    guard.get_or_insert_with(get_all_reserved_words).clone()
+    guard
+        .get_or_insert_with(|| {
+            get_all_reserved_words()
+                .into_iter()
+                .map(|name| CommandWordInfo::Keyword {
+                    command: name,
+                    usage: None,
+                })
+                .collect()
+        })
+        .clone()
 }
 
 #[cfg(not(test))]
-fn get_cached_shell_functions() -> Vec<String> {
+fn get_cached_shell_functions() -> Vec<CommandWordInfo> {
     let mut guard = DEFINED_SHELL_FUNCTIONS.lock().unwrap();
-    guard.get_or_insert_with(get_all_shell_functions).clone()
+    guard
+        .get_or_insert_with(|| {
+            get_all_shell_functions()
+                .into_iter()
+                .map(|name| unsafe {
+                    let name_c = std::ffi::CString::new(name.clone()).unwrap();
+                    let func_def_ptr = bash_symbols::find_function_def(name_c.as_ptr());
+                    if !func_def_ptr.is_null() {
+                        let func_def = &*func_def_ptr;
+                        let line = if func_def.line > 0 {
+                            Some(func_def.line)
+                        } else {
+                            None
+                        };
+                        let source_file = if func_def.source_file.is_null() {
+                            None
+                        } else {
+                            std::ffi::CStr::from_ptr(func_def.source_file)
+                                .to_str()
+                                .ok()
+                                .map(|s| s.to_string())
+                        };
+                        CommandWordInfo::Function {
+                            command: name,
+                            source_file,
+                            line,
+                        }
+                    } else {
+                        CommandWordInfo::Function {
+                            command: name,
+                            source_file: None,
+                            line: None,
+                        }
+                    }
+                })
+                .collect()
+        })
+        .clone()
 }
 
 #[cfg(not(test))]
-fn get_cached_builtins() -> Vec<String> {
+fn get_cached_builtins() -> Vec<CommandWordInfo> {
     let mut guard = DEFINED_BUILTINS.lock().unwrap();
-    guard.get_or_insert_with(get_all_shell_builtins).clone()
+    guard
+        .get_or_insert_with(|| {
+            get_all_shell_builtins()
+                .into_iter()
+                .map(|name| CommandWordInfo::Builtin {
+                    command: name,
+                    usage: None,
+                })
+                .collect()
+        })
+        .clone()
 }
 
 /// Per-directory executable cache entry: the directory's last-modified time and
@@ -1402,8 +1568,16 @@ impl ExecutablesOnPath {
     }
 
     /// Iterate over the names of all cached executables.
-    fn iter_names(&self) -> impl Iterator<Item = &String> + '_ {
-        self.cache.values().flat_map(|entry| entry.names.iter())
+    fn iter_info(&self) -> impl Iterator<Item = CommandWordInfo> + '_ {
+        self.cache.iter().flat_map(|(dir, entry)| {
+            entry.names.iter().map(move |name| {
+                let path = dir.join(name).to_string_lossy().into_owned();
+                CommandWordInfo::File {
+                    command: name.clone(),
+                    path,
+                }
+            })
+        })
     }
 
     /// Scan `dir` and return the names of all executable files it contains.
@@ -1411,7 +1585,7 @@ impl ExecutablesOnPath {
         let mut names = Vec::new();
         if let Ok(entries) = std::fs::read_dir(dir) {
             for entry in entries.flatten() {
-                if let Ok(metadata) = entry.metadata()
+                if let Ok(metadata) = std::fs::metadata(entry.path())
                     && metadata.is_file()
                 {
                     let permissions = metadata.permissions();
@@ -1436,14 +1610,14 @@ pub(crate) static LS_COLORS: LazyLock<Option<LsColors>> =
 
 /// Get all potential first word completions (aliases, reserved words, functions, builtins, executables)
 #[cfg(not(test))]
-pub fn get_possible_command_words() -> impl Iterator<Item = String> {
+pub fn get_possible_command_words() -> impl Iterator<Item = CommandWordInfo> {
     let aliases = get_cached_aliases();
     let reserved_words = get_cached_reserved_words();
     let shell_functions = get_cached_shell_functions();
     let builtins = get_cached_builtins();
     let mut exe_guard = EXECUTABLES_ON_PATH.lock().unwrap();
     exe_guard.update_cache();
-    let executables: Vec<String> = exe_guard.iter_names().cloned().collect();
+    let executables: Vec<CommandWordInfo> = exe_guard.iter_info().collect();
     drop(exe_guard);
 
     aliases
@@ -1455,8 +1629,13 @@ pub fn get_possible_command_words() -> impl Iterator<Item = String> {
 }
 
 #[cfg(test)]
-pub fn get_possible_command_words() -> impl Iterator<Item = String> {
-    get_all_reserved_words().into_iter()
+pub fn get_possible_command_words() -> impl Iterator<Item = CommandWordInfo> {
+    get_all_reserved_words()
+        .into_iter()
+        .map(|name| CommandWordInfo::Keyword {
+            command: name,
+            usage: None,
+        })
 }
 
 #[cfg(not(test))]
