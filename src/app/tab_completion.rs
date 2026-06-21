@@ -1207,8 +1207,9 @@ impl App<'_> {
             (fds[0], fds[1])
         };
 
-        // Since the fork doesnt live for long, the main process should have the caches warm
-        crate::bash_funcs::warm_completion_caches();
+        // Ensure the background warming thread has finished before we fork,
+        // to prevent fork-deadlocks on inherited locked mutexes in the child process.
+        crate::threads::join_threads_by_tag(crate::threads::ThreadTag::Warming);
 
         let pid = unsafe { libc::fork() };
 
@@ -1271,7 +1272,7 @@ impl App<'_> {
             }
 
             // Using a thread here makes it easier to handle polling here and in the main app loop.
-            std::thread::spawn(move || {
+            let thread_handle = std::thread::spawn(move || {
                 let mut file = unsafe { std::fs::File::from_raw_fd(read_fd) };
                 let mut len_buf = [0u8; 8];
                 if std::io::Read::read_exact(&mut file, &mut len_buf).is_err() {
@@ -1290,7 +1291,14 @@ impl App<'_> {
             });
 
             // Block for some time waiting for the process to finish.
-            match rx.recv_timeout(std::time::Duration::from_millis(40)) {
+            // If automatically started, block for at most 10ms. If user-triggered, block for at most 80ms.
+            let timeout = if auto_started {
+                std::time::Duration::from_millis(10)
+            } else {
+                std::time::Duration::from_millis(80)
+            };
+
+            match rx.recv_timeout(timeout) {
                 Ok(Some((builder, elapsed))) => {
                     self.finish_tab_complete(builder, wuc_substring, elapsed, auto_started);
                 }
@@ -1309,6 +1317,7 @@ impl App<'_> {
                         handle: TabCompletionHandle {
                             receiver: rx,
                             pid: Some(pid),
+                            thread_handle: Some(thread_handle),
                         },
                         wuc_substring,
                         start_time,

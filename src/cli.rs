@@ -1,7 +1,15 @@
+macro_rules! return_usage_error {
+    ($($arg:tt)*) => {{
+        eprintln!($($arg)*);
+        return crate::bash_symbols::BuiltinExitCode::Usage as ::libc::c_int;
+    }};
+}
+
 use clap::{CommandFactory, Parser, Subcommand, error::ErrorKind};
 use clap_complete::{ArgValueCompleter, CompletionCandidate};
 use libc::c_int;
 use strum::VariantArray;
+
 
 use crate::{
     Flyline,
@@ -529,6 +537,25 @@ enum Commands {
         #[arg(long = "mode", value_name = "MODE")]
         mode: Option<settings::MouseMode>,
     },
+    /// Performance profiling commands: start, stop, or dump stats.
+    #[command(name = "perf", verbatim_doc_comment)]
+    Perf {
+        #[command(subcommand)]
+        subcommand: PerfSubcommands,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum PerfSubcommands {
+    /// Start recording performance metrics.
+    #[command(name = "start")]
+    Start,
+    /// Stop recording performance metrics.
+    #[command(name = "stop")]
+    Stop,
+    /// Dump aggregated performance metrics to stdout.
+    #[command(name = "dump")]
+    Dump,
 }
 
 #[derive(Subcommand, Debug)]
@@ -1367,6 +1394,19 @@ impl Flyline {
                             self.settings.cursor_config.effect_easing = easing;
                         }
                     }
+                    Some(Commands::Perf { subcommand }) => match subcommand {
+                        PerfSubcommands::Start => {
+                            crate::perf::start_recording();
+                            println!("Performance recording started.");
+                        }
+                        PerfSubcommands::Stop => {
+                            crate::perf::stop_recording();
+                            println!("Performance recording stopped.");
+                        }
+                        PerfSubcommands::Dump => {
+                            crate::perf::dump_to_stdout();
+                        }
+                    },
                 }
 
                 bash_symbols::BuiltinExitCode::ExecutionSuccess as c_int
@@ -1404,3 +1444,21 @@ impl Flyline {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_perf_subcommand_completions() {
+        let raw_cmd = "flyline perf ";
+        let wuc = "";
+        let cursor_byte = raw_cmd.len();
+        let comps = complete_flyline_args(raw_cmd, wuc, cursor_byte).unwrap();
+        let values: Vec<String> = comps.into_iter().map(|c| c.get_value().to_string_lossy().into_owned()).collect();
+        assert!(values.contains(&"start".to_string()));
+        assert!(values.contains(&"stop".to_string()));
+        assert!(values.contains(&"dump".to_string()));
+    }
+}
+

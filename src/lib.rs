@@ -7,7 +7,8 @@ pub const FILENAME_INFERENCE_LIMIT: usize = 5000;
 use ctor::ctor;
 
 #[macro_use]
-mod macros;
+pub(crate) mod perf;
+pub(crate) mod threads;
 mod active_suggestions;
 mod agent_mode;
 mod app;
@@ -285,6 +286,7 @@ fn flyline_load_common() -> c_int {
         return SUCCESS;
     }
 
+
     logging::init().unwrap_or_else(|e| {
         eprintln!("Flyline failed to setup logging: {}", e);
     });
@@ -426,6 +428,7 @@ fn flyline_load_common() -> c_int {
 #[unsafe(no_mangle)]
 pub extern "C" fn flyline_builtin_unload() {
     log::info!("flyline_builtin_unload called, unloading flyline");
+    crate::threads::join_all_before_unload();
 
     bash_funcs::unset_env_var(FLYLINE_ENV_VAR_NAME).unwrap_or_else(|e| {
         log::error!(
