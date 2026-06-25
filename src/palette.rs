@@ -153,6 +153,8 @@ pub enum PaletteStyleKind {
     Comment,
     #[strum(message = "Syntax highlighting for environment variable references (e.g. $HOME)")]
     EnvVar,
+    #[strum(message = "Syntax highlighting for unrecognised environment variable references")]
+    UnrecognisedEnvVar,
     #[strum(message = "Style for level-1 Markdown headings (# heading)")]
     MarkdownHeading1,
     #[strum(message = "Style for level-2 Markdown headings (## heading)")]
@@ -198,6 +200,7 @@ pub struct Palette {
     normal_text: Style,
     comment: Style,
     env_var: Style,
+    unrecognised_env_var: Style,
     markdown_heading1: Style,
     markdown_heading2: Style,
     markdown_heading3: Style,
@@ -260,6 +263,10 @@ impl Palette {
         self.env_var
     }
 
+    pub fn unrecognised_env_var(&self) -> Style {
+        self.unrecognised_env_var
+    }
+
     pub fn markdown_heading1(&self) -> Style {
         self.markdown_heading1
     }
@@ -315,6 +322,7 @@ impl Palette {
             PaletteStyleKind::NormalText => self.normal_text = style,
             PaletteStyleKind::Comment => self.comment = style,
             PaletteStyleKind::EnvVar => self.env_var = style,
+            PaletteStyleKind::UnrecognisedEnvVar => self.unrecognised_env_var = style,
             PaletteStyleKind::MarkdownHeading1 => self.markdown_heading1 = style,
             PaletteStyleKind::MarkdownHeading2 => self.markdown_heading2 = style,
             PaletteStyleKind::MarkdownHeading3 => self.markdown_heading3 = style,
@@ -357,6 +365,7 @@ impl Palette {
                 .fg(Color::Red)
                 .add_modifier(Modifier::ITALIC),
             env_var: Style::default().fg(Color::Cyan),
+            unrecognised_env_var: Style::default().fg(Color::Red),
             markdown_heading1: Style::default()
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
@@ -406,6 +415,7 @@ impl Palette {
                 .fg(Color::Gray)
                 .add_modifier(Modifier::ITALIC),
             env_var: Style::default().fg(Color::Blue),
+            unrecognised_env_var: Style::default().fg(Color::Red),
             markdown_heading1: Style::default()
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),

@@ -141,6 +141,7 @@ fn is_bash_reserved_token_kind(kind: &TokenKind) -> bool {
 fn token_to_style(
     token: &AnnotatedToken,
     recognised_command: Option<bool>,
+    recognised_env_var: Option<bool>,
     cursor_on_this_or_closing_token: bool,
     palette: &Palette,
 ) -> Style {
@@ -157,6 +158,9 @@ fn token_to_style(
     // `is_env_var` and `is_inside_double_quotes` (e.g. `$HOME` in `"$HOME"`), and the env var
     // color should win over the double-quoted color.
     if token.annotations.is_env_var {
+        if recognised_env_var == Some(false) {
+            return palette.unrecognised_env_var();
+        }
         return palette.env_var();
     }
 
@@ -219,6 +223,7 @@ impl FormattedBufferPart {
         cursor_byte_pos_in_token: Option<usize>,
         selection_byte_pos_in_token: Option<usize>,
         palette: &Palette,
+        recognised_env_var: Option<bool>,
     ) -> Self {
         let word_info = get_word_info(token);
         let tooltip = word_info.as_ref().and_then(|info| info.tooltip.clone());
@@ -227,6 +232,7 @@ impl FormattedBufferPart {
         let style = token_to_style(
             token,
             recognised_command,
+            recognised_env_var,
             cursor_on_this_or_closing_token,
             palette,
         );
@@ -441,6 +447,22 @@ pub fn format_buffer(
 
     let use_inclusive = !strict_highlight.iter().any(|&b| b);
 
+    let mut env_var_recognised = vec![false; annotated_tokens.len()];
+    for idx in 0..annotated_tokens.len() {
+        let tok = &annotated_tokens[idx];
+        if tok.annotations.is_env_var {
+            if tok.token.kind.is_word() {
+                let name = &tok.token.value;
+                if bash_funcs::get_envvar_value(name).is_some() {
+                    env_var_recognised[idx] = true;
+                    if idx > 0 && annotated_tokens[idx - 1].token.kind == TokenKind::Dollar {
+                        env_var_recognised[idx - 1] = true;
+                    }
+                }
+            }
+        }
+    }
+
     let spans: Vec<FormattedBufferPart> = annotated_tokens
         .iter()
         .enumerate()
@@ -459,12 +481,18 @@ pub fn format_buffer(
                     None
                 }
             });
+            let recognised_env_var = if tok.annotations.is_env_var {
+                Some(env_var_recognised[idx])
+            } else {
+                None
+            };
             FormattedBufferPart::new(
                 tok,
                 highlight,
                 cursor_pos_in_token,
                 selection_pos_in_token,
                 palette,
+                recognised_env_var,
             )
         })
         .collect();
@@ -516,6 +544,7 @@ pub fn format_agent_buffer(
                 cursor_pos_in_token,
                 selection_pos_in_token,
                 palette,
+                None,
             );
 
             if tok.token.kind.is_word() && !found_first_word {
@@ -809,5 +838,33 @@ mod tests {
         assert_eq!(palette.rainbow_bracket(1), palette.rainbow_bracket(5));
         assert_eq!(palette.rainbow_bracket(2), palette.rainbow_bracket(6));
         assert_eq!(palette.rainbow_bracket(3), palette.rainbow_bracket(7));
+    }
+
+    #[test]
+    fn test_recognised_vs_unrecognised_env_var_styling() {
+        let palette = Palette::dark();
+        let input = "echo $HOME $UNRECOGNISED_VAR_XYZ";
+        let fb = FormattedBuffer::from(input, input.len(), None);
+
+        let dollar_signs = parts_with_value(&fb, "$");
+        assert_eq!(dollar_signs.len(), 2);
+
+        let home_parts = parts_with_value(&fb, "HOME");
+        assert_eq!(home_parts.len(), 1);
+
+        let unrec_parts = parts_with_value(&fb, "UNRECOGNISED_VAR_XYZ");
+        assert_eq!(unrec_parts.len(), 1);
+
+        assert_eq!(home_parts[0].normal_span().style, palette.env_var());
+        assert_eq!(dollar_signs[0].normal_span().style, palette.env_var());
+
+        assert_eq!(
+            unrec_parts[0].normal_span().style,
+            palette.unrecognised_env_var()
+        );
+        assert_eq!(
+            dollar_signs[1].normal_span().style,
+            palette.unrecognised_env_var()
+        );
     }
 }
