@@ -310,6 +310,7 @@ pub(crate) enum ContentMode {
         wuc_substring: SubString,
         start_time: std::time::Instant,
         auto_started: bool,
+        last_active_suggestions: Option<Box<ActiveSuggestions>>,
     },
     /// AI command is running as a child process.  The child is polled each
     /// event-loop iteration with `try_wait`; on drop it is killed and reaped.
@@ -784,6 +785,7 @@ impl<'a> App<'a> {
     }
 
     fn on_mouse(&mut self, mouse: MouseEvent) -> bool {
+        let _timer = crate::perf::PerfTimer::start("on_mouse");
         log::trace!("Mouse event: {:?}", mouse);
 
         let now = std::time::Instant::now();
@@ -2232,6 +2234,9 @@ impl<'a> App<'a> {
         self.formatted_buffer_cache = if matches!(
             self.content_mode,
             ContentMode::FuzzyHistorySearch(FuzzyHistorySource::AgentPrompts)
+                | ContentMode::AgentError { .. }
+                | ContentMode::AgentOutputSelection { .. }
+                | ContentMode::AgentModeWaiting { .. }
         ) {
             format_agent_buffer(
                 &self.dparser_tokens_cache,
