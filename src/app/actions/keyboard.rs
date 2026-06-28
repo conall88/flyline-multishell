@@ -786,10 +786,10 @@ impl KeyEventAction {
             // Normally the terminal emulator handles Ctrl+V
             // But if it doesn't it gives us an opportunity use OSC52 request system clibpoard!
             KeyEventAction::PasteSystemClipboard => {
-                use std::io::Write;
-                let mut stdout = std::io::stdout();
-                let _ = stdout.write_all(b"\x1b]52;c;?\x07");
-                let _ = stdout.flush();
+                let _ = crossterm::execute!(
+                    std::io::stdout(),
+                    crossterm::clipboard::RequestClipboardContents::clipboard()
+                );
             }
             KeyEventAction::InsertLastWordFromPrevCommand => {
                 app.buffer.clear_selection();
