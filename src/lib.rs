@@ -13,6 +13,7 @@ mod agent_mode;
 mod app;
 mod bash_funcs;
 mod bash_symbols;
+mod changelog;
 mod cli;
 mod command_acceptance;
 mod content_builder;
