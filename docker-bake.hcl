@@ -210,6 +210,11 @@ target "demo-flycomp-extracted" {
     dockerfile = "docker/demo_flycomp.Dockerfile"
 }
 
+target "demo-cursor-style-extracted" {
+    inherits = ["_demo-base"]
+    dockerfile = "docker/demo_cursor_style.Dockerfile"
+}
+
 group "demos" {
     targets = [
         "demo-overview-extracted",
@@ -223,7 +228,8 @@ group "demos" {
         "demo-inline-history-extracted",
         "demo-tab-completion-easing-extracted",
         "demo-auto-tab-completion-extracted",
-        "demo-flycomp-extracted"
+        "demo-flycomp-extracted",
+        "demo-cursor-style-extracted"
     ]
 }
 

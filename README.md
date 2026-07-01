@@ -24,12 +24,11 @@ When Bash prompts you for a command, a library called [readline](https://www.gnu
 - [Synthesize tab completion suggestions](#automatic-completion-synthesis-flycomp) with [flycomp](https://github.com/HalFrgrd/flycomp)
 - [Agent assisted command writing](#agent-mode)
 - Tooltips
-- Undo and redo support
 - Text selection
 - Auto close brackets and quotes
 - Syntax highlighting
 - Runs in the same process as Bash
-- Cursor animations and styles
+- [Cursor animations and styles](#cursor-animations-and-styles)
 
 Flyline is similar to [ble.sh](https://github.com/akinomyoga/ble.sh) but is written in Rust and uses [ratatui.rs](https://ratatui.rs/) to more easily draw complex user interfaces.
 
@@ -440,6 +439,24 @@ Pressing `Up` will scroll through history entries that are a prefix match with t
 
 **Zsh history entries:**
 Optionally read Zsh history entries to make migrating to Bash easier.
+
+# Cursor animations and styles
+
+Flyline can configure the cursor styling, color, and interpolation/easing animations. When moving the cursor or deleting/inserting characters, the cursor dynamically slides and animates to its new position.
+
+You can configure the style and animation effects using the `flyline set-cursor` command:
+
+[![Cursor style demo](https://github.com/HalFrgrd/flyline/releases/download/assets/demo_cursor_style.gif)](https://github.com/HalFrgrd/evp)
+
+For example, to configure a custom color with elastic interpolation and fade effects:
+```bash
+flyline set-cursor --backend flyline --style "#33ccff" --effect fade --effect-easing in-out-sine --interpolate-easing out-elastic --interpolate 2
+```
+
+To see all available options (such as terminal-native cursor backends or other easing equations):
+```bash
+flyline set-cursor --help
+```
 
 # Terminal emulator notes
 ## VS Code:
