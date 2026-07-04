@@ -51,6 +51,50 @@ curl -sSfL https://github.com/HalFrgrd/flyline/releases/latest/download/install.
 ```
 On macOS you must first install a version of Bash that supports custom builtins: `brew install bash`
 
+### Zsh
+
+The same `install.sh` also sets up zsh when `zsh` is on your `PATH`: it installs `flyline-standalone` and `libflyline.so` under `~/.local/lib` (or `FLYLINE_INSTALL_DIR`), drops `scripts/flyline.zsh` there, and adds a guarded block to `~/.zshrc`:
+
+```text
+# >>> flyline start >>>
+export FLYLINE_BIN="$HOME/.local/lib/flyline-standalone"
+[[ -r "$HOME/.local/lib/scripts/flyline.zsh" ]] && . "$HOME/.local/lib/scripts/flyline.zsh"
+# <<< flyline end <<<
+```
+
+Before the first edit, your existing `~/.zshrc` is copied to `~/.zshrc.flyline.bak.TIMESTAMP`. Re-running the installer is idempotent: it will not duplicate the marker block.
+
+**Enable / disable (current shell):**
+
+```zsh
+flyline_enable    # turn flyline on (already on after install)
+flyline_disable   # restore native ZLE for this session
+```
+
+**Uninstall:**
+
+```zsh
+flyline_uninstall   # disable flyline and unset FLYLINE_BIN in this session
+```
+
+```sh
+sh install.sh --uninstall   # remove the ~/.zshrc block, flyline-standalone, and scripts/flyline.zsh
+```
+
+`libflyline.so` is kept for Bash; remove it manually if you no longer use flyline with Bash.
+
+**Fail-open:** flyline runs as a separate process from a `zle-line-init` hook. If the binary is missing, you cancel, or flyline crashes, zsh falls back to native line editing for that line — your shell keeps working.
+
+**Completions reuse your zsh setup.** flyline drives a persistent headless zsh that loads your `~/.zshrc`, so it completes exactly what your interactive zsh does — oh-my-zsh plugins, `compinit` functions on your `fpath`, and anything you `source`. flyline does not invent completions: if a tool isn't set up to complete in your own zsh, it won't complete in flyline either. For example, `kubectl <Tab>` works only if your zsh actually configures it (add `kubectl` to your oh-my-zsh `plugins=(…)`, or `source <(kubectl completion zsh)` in `~/.zshrc`); once it does, flyline shows the same subcommands and descriptions. kubectl's warm latency (~400ms) is mostly its own API round-trip and matches native zsh.
+
+**`FLYLINE_ZSH_NO_RCS=1`** makes flyline's helper shells skip your `~/.zshrc` (a pristine `zsh -f`). Boot is faster and more predictable, but you lose user/plugin completions (only system `fpath` completions remain). Use it if a heavy prompt framework misbehaves headlessly.
+
+#### Zsh limitations
+
+- **History is file-mediated.** The widget runs `fc -AI` to flush the current session's history to `$HISTFILE` before launching flyline, which then reads the file — recent commands are visible, but this is not a live read of the parent shell's in-memory list.
+- **One-time rc boot cost.** Loading a heavy `~/.zshrc` (e.g. powerlevel10k) adds ~1–2s when the completion daemon first starts; the persistent daemon amortizes it across the session. `FLYLINE_ZSH_NO_RCS=1` avoids it.
+- **Variable introspection is partial.** Variable tooltips and `$VAR` completion use a per-call `zsh -f`, so they see exported environment variables but not unexported shell parameters.
+
 ### Arch Linux
 
 Arch users can install the [AUR package](https://aur.archlinux.org/packages/flyline):

@@ -35,6 +35,7 @@ use crate::app::actions::KeyEventAction;
 use crate::app::formatted_buffer::{FormattedBuffer, format_agent_buffer, format_buffer};
 use crate::content_builder::{Contents, SpanTag, Tag, TaggedLine, TaggedSpan};
 use crate::cursor::{Cursor, CursorBackend};
+use crate::dparser;
 use crate::dparser::{AnnotatedToken, ToInclusiveRange};
 use crate::history::{HistoryEntry, HistoryEntryFormatted, HistoryManager};
 use crate::iter_first_last::FirstLast;
@@ -45,7 +46,6 @@ use crate::prompt_manager::PromptManager;
 use crate::settings::{self, MatrixAnimation, MouseMode, Settings};
 use crate::shell_integration;
 use crate::text_buffer::{SubString, TextBuffer};
-use crate::{bash_funcs, dparser};
 use crate::{bash_symbols, command_acceptance};
 use crossterm::event::{
     self, Event as CrosstermEvent, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent,
@@ -407,21 +407,22 @@ pub(crate) struct App<'a> {
 
 impl<'a> App<'a> {
     fn new(settings: &'a mut Settings) -> Self {
-        let unfinished_from_prev_command =
-            unsafe { crate::bash_symbols::current_command_line_count } > 0;
+        let unfinished_from_prev_command = crate::shell::backend().multiline_command_count() > 0;
         let initial_buf_val = settings.initial_buffer.take().unwrap_or_default();
         let buffer = TextBuffer::new(&initial_buf_val);
         let formatted_buffer_cache = FormattedBuffer::default();
 
-        bash_funcs::reset_caches();
+        if crate::shell::backend().is_bash() {
+            crate::shell::backend().reset_caches();
+            // Join any previous warming thread to prevent multiple active warming threads
+            crate::threads::join_bash_func_threads();
+        }
 
-        // Join any previous warming thread to prevent multiple active warming threads
-        crate::threads::join_bash_func_threads();
-
+        // Warm completions off the hot path (for zsh, boots the shared broker).
         let _ = crate::threads::spawn_thread(crate::threads::ThreadTag::Warming, || {
             let _timer = crate::perf::PerfTimer::start("warming_thread");
             let start = std::time::Instant::now();
-            crate::bash_funcs::warm_completion_caches();
+            crate::shell::backend().warm_completion_caches();
             log::info!("Warming thread finished in {:?}", start.elapsed());
         });
 
@@ -510,10 +511,9 @@ impl<'a> App<'a> {
         // Send execution finished escape codes (previous command has completed).
         time_it!("startup: escape codes", {
             if self.settings.send_shell_integration_codes == settings::ShellIntegrationLevel::Full {
-                let last_command_exit_value =
-                    unsafe { crate::bash_symbols::last_command_exit_value };
-                let hostname = bash_funcs::get_hostname();
-                let cwd = bash_funcs::get_cwd();
+                let last_command_exit_value = crate::shell::backend().last_command_exit_status();
+                let hostname = crate::shell::backend().hostname();
+                let cwd = crate::shell::backend().cwd();
 
                 shell_integration::write_startup_codes(last_command_exit_value, &hostname, &cwd)
                     .unwrap_or_else(|e| {
@@ -565,7 +565,9 @@ impl<'a> App<'a> {
                 Err(err) => panic!("Failed to create terminal: {}", err),
             };
 
-            bash_symbols::set_readline_state(bash_symbols::RL_STATE_TERMPREPPED);
+            if crate::shell::backend().is_bash() {
+                bash_symbols::set_readline_state(bash_symbols::RL_STATE_TERMPREPPED);
+            }
             terminal
         });
 
@@ -720,7 +722,7 @@ impl<'a> App<'a> {
             // In bash >= 4.4 (readline 6.0+), rl_signal_event_hook is set when
             // bash receives a terminating signal.
             // But just checking for terminating_signal works on all versions of bash, and is more direct.
-            let terminating_signal = bash_funcs::read_terminating_signal();
+            let terminating_signal = crate::shell::backend().read_terminating_signal();
 
             if terminating_signal != 0 {
                 log::info!(
@@ -732,7 +734,9 @@ impl<'a> App<'a> {
             }
         }
 
-        bash_symbols::clear_readline_state(bash_symbols::RL_STATE_TERMPREPPED);
+        if crate::shell::backend().is_bash() {
+            bash_symbols::clear_readline_state(bash_symbols::RL_STATE_TERMPREPPED);
+        }
 
         match self.mode {
             AppRunningState::Exiting(ExitState::WithCommand(cmd)) => {
@@ -1163,7 +1167,7 @@ impl<'a> App<'a> {
                         Ok(Ok(script)) => {
                             log::info!("flycomp succeeded for command '{}'", command_word);
                             let output_dir = self.settings.flycomp_output.as_deref();
-                            match crate::bash_funcs::resolve_and_write_completion_script(
+                            match crate::shell::backend().resolve_and_write_completion_script(
                                 &command_word,
                                 &script,
                                 output_dir,
@@ -1179,7 +1183,7 @@ impl<'a> App<'a> {
                                 }
                             }
 
-                            match crate::bash_funcs::evaluate_shell_string(&script) {
+                            match crate::shell::backend().evaluate_shell_string(&script) {
                                 Ok(_) => {
                                     log::info!(
                                         "Successfully evaluated synthesized completion script for '{}'",
@@ -1239,7 +1243,7 @@ impl<'a> App<'a> {
         word_under_cursor: String,
         use_sandbox: bool,
     ) {
-        let poss_alias = crate::bash_funcs::find_alias(&command_word);
+        let poss_alias = crate::shell::backend().find_alias(&command_word);
         let alias_def = poss_alias
             .as_deref()
             .filter(|alias| !alias.is_empty())
@@ -1252,7 +1256,7 @@ impl<'a> App<'a> {
 
         let mut cmd_word = alias_expanded_command_word;
         if cmd_word.starts_with('~') || cmd_word.contains('/') {
-            let expanded = crate::bash_funcs::fully_expand_path(&cmd_word);
+            let expanded = crate::shell::backend().expand_path(&cmd_word);
             if !expanded.is_empty() {
                 cmd_word = expanded;
             }
@@ -1285,7 +1289,7 @@ impl<'a> App<'a> {
             // No agent configured at all — try to find a suitable one from the example file.
             let setup_cmd = crate::agent_mode::parse_example_agent_commands()
                 .into_iter()
-                .find(|(cmd_name, _)| bash_funcs::get_command_info(cmd_name).is_known())
+                .find(|(cmd_name, _)| crate::shell::backend().command_info(cmd_name).is_known())
                 .map(|(_, flyline_cmd)| flyline_cmd);
 
             match setup_cmd {

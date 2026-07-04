@@ -12,6 +12,8 @@ mod active_suggestions;
 mod agent_mode;
 mod app;
 mod bash_funcs;
+#[cfg(feature = "standalone")]
+mod bash_stubs;
 mod bash_symbols;
 mod changelog;
 mod cli;
@@ -30,6 +32,7 @@ mod mouse_state;
 mod palette;
 mod prompt_manager;
 mod settings;
+mod shell;
 mod shell_integration;
 mod snake_animation;
 mod stateful_sliding_window;
@@ -40,6 +43,20 @@ pub(crate) mod threads;
 mod tutorial;
 pub mod unicode_helpers;
 mod users;
+
+#[cfg(feature = "standalone")]
+pub use app::{ExitState, get_command};
+#[cfg(feature = "standalone")]
+pub use settings::Settings;
+#[cfg(feature = "standalone")]
+pub use shell::zsh::{ZSH_BACKEND, run_comp_broker, set_cloexec};
+#[cfg(feature = "standalone")]
+pub use shell::{backend, is_zsh_host_env, set_backend};
+
+#[cfg(feature = "standalone")]
+pub fn init_standalone_logging() -> anyhow::Result<()> {
+    logging::init()
+}
 
 // Global state for our custom input stream
 static FLYLINE_INSTANCE_PTR: Mutex<Option<Box<Flyline>>> = Mutex::new(None);

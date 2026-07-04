@@ -8,10 +8,11 @@ use crate::active_suggestions::{
     UnprocessedSuggestion,
 };
 use crate::app::{App, ContentMode, FlycompPromptSelection, TabCompletionHandle};
-use crate::bash_funcs::{self, QuoteType};
+use crate::bash_funcs::{CompletionFlags, QuoteType};
 use crate::content_utils::{self, ansi_string_to_spans};
 use crate::globbing::PathPatternExpansion;
 use crate::iter_first_last::FirstLast;
+use crate::shell::{CommandWordInfo, backend};
 use crate::tab_completion_context::CompType;
 use crate::text_buffer::SubString;
 use crate::users;
@@ -52,7 +53,7 @@ fn run_comp_spec_completion(
     completion_context: &tab_completion_context::CompletionContext,
     initial_command_word: &str,
 ) -> Option<ActiveSuggestionsBuilder> {
-    let poss_alias = bash_funcs::find_alias(initial_command_word);
+    let poss_alias = backend().find_alias(initial_command_word);
     log::debug!(
         "Checking for alias for command word '{}': {:?}",
         initial_command_word,
@@ -81,7 +82,7 @@ fn run_comp_spec_completion(
     if alias_expanded_command_word == "flyline" {
         run_flyline_compspec(alias_expanded_completion_context)
     } else {
-        let poss_completions = bash_funcs::run_programmable_completions(
+        let poss_completions = backend().run_programmable_completions(
             alias_expanded_full_command,
             &alias_expanded_command_word,
             alias_expanded_word_under_cursor,
@@ -132,14 +133,14 @@ fn run_flyline_compspec(
     // attached to each candidate) are preserved as-is.
     match complete_flyline_args(full_command, word_under_cursor, cursor_byte_pos) {
         Ok(candidates) => {
-            let quote_type = bash_funcs::find_quote_type(word_under_cursor);
+            let quote_type = crate::bash_funcs::find_quote_type(word_under_cursor);
 
             let processed: Vec<ProcessedSuggestion> = candidates
                 .into_iter()
                 .filter_map(|c| {
                     let value = c.get_value().to_string_lossy().to_string();
                     let value = if let Some(qt) = quote_type {
-                        bash_funcs::quoting_function_rust(&value, qt, true, false)
+                        crate::bash_funcs::quoting_function_rust(&value, qt, true, false)
                     } else {
                         value.clone()
                     };
@@ -370,7 +371,7 @@ fn gen_completions_uncomitted(
             CompType::EnvVariable => {
                 log::debug!("CompType::EnvVariable for {}", word_under_cursor.as_ref());
                 let matching_vars =
-                    bash_funcs::get_all_variables_with_prefix(word_under_cursor.as_ref());
+                    crate::shell::backend().vars_with_prefix(word_under_cursor.as_ref());
                 log::debug!(
                     "CompType::EnvVariable found {} completions for prefix: {}",
                     matching_vars.len(),
@@ -600,7 +601,7 @@ fn tab_complete_first_word(command: &str, word_under_cursor: &str) -> ActiveSugg
 
     let mut res = vec![];
     let mut seen: HashSet<String> = HashSet::new();
-    for poss_info in bash_funcs::get_possible_command_words() {
+    for poss_info in backend().possible_command_words() {
         let cmd_name = poss_info.command();
         if cmd_name.starts_with(command) && seen.insert(cmd_name.to_string()) {
             res.push(poss_info);
@@ -620,7 +621,7 @@ fn tab_complete_first_word(command: &str, word_under_cursor: &str) -> ActiveSugg
 }
 
 fn processed_suggestions_from_command_info(
-    command_infos: Vec<bash_funcs::CommandWordInfo>,
+    command_infos: Vec<CommandWordInfo>,
 ) -> Vec<ProcessedSuggestion> {
     command_infos
         .into_iter()
@@ -632,7 +633,7 @@ fn processed_suggestions_from_command_info(
                 " ".to_string()
             };
             let description_str = info.to_description();
-            let description = if matches!(info, bash_funcs::CommandWordInfo::Unknown { .. }) {
+            let description = if matches!(info, CommandWordInfo::Unknown { .. }) {
                 SuggestionDescription::Static(vec![])
             } else {
                 SuggestionDescription::Static(vec![ratatui::text::Span::raw(description_str)])
@@ -658,7 +659,7 @@ fn tab_complete_fuzzy_first_word(command: &str) -> ActiveSuggestionsBuilder {
     let mut scored = vec![];
 
     let mut seen: HashSet<String> = HashSet::new();
-    for poss_info in bash_funcs::get_possible_command_words() {
+    for poss_info in backend().possible_command_words() {
         let cmd_name = poss_info.command();
         if seen.insert(cmd_name.to_string())
             && let Some(score) = content_utils::fuzzy_match_with_threshold(
@@ -683,7 +684,7 @@ fn tab_complete_fuzzy_first_word(command: &str) -> ActiveSuggestionsBuilder {
 /// `should_skip_hidden`: If true, skip files starting with `.` (unless pattern explicitly requests them).
 fn tab_complete_with_expanded_pattern(
     expanded: &PathPatternExpansion,
-    comp_resultflags: bash_funcs::CompletionFlags,
+    comp_resultflags: CompletionFlags,
     wuc: &str,
     should_skip_hidden: bool,
 ) -> Vec<UnprocessedSuggestion> {
@@ -751,8 +752,8 @@ fn tab_complete_with_expanded_pattern(
 fn tab_complete_glob_expansion(
     pattern: &str,
     word_under_cursor: &str,
-) -> (Vec<UnprocessedSuggestion>, bash_funcs::CompletionFlags) {
-    let mut comp_resultflags = bash_funcs::CompletionFlags::default();
+) -> (Vec<UnprocessedSuggestion>, CompletionFlags) {
+    let mut comp_resultflags = CompletionFlags::default();
     // We will handle it ourselves because the prefix should not be quoted but the found filename should be.
     // e.g. my_command $PWD/fi<TAB> should expand to:
     // my_command $PWD/file\ with\ spaces.txt
@@ -761,7 +762,7 @@ fn tab_complete_glob_expansion(
     comp_resultflags.filename_quoting_desired = false;
     comp_resultflags.filename_completion_desired = true;
 
-    comp_resultflags.quote_type = bash_funcs::find_quote_type(pattern);
+    comp_resultflags.quote_type = crate::bash_funcs::find_quote_type(pattern);
     log::debug!("found quote type: {:?}", comp_resultflags.quote_type);
 
     let expanded = PathPatternExpansion::new(pattern);
@@ -779,13 +780,13 @@ fn tab_complete_glob_expansion(
 /// but the fuzzy matcher will.
 fn tab_complete_fuzzy_filename_from_word(
     word_under_cursor: &str,
-) -> (Vec<UnprocessedSuggestion>, bash_funcs::CompletionFlags) {
+) -> (Vec<UnprocessedSuggestion>, CompletionFlags) {
     tab_complete_fuzzy_filename_impl(word_under_cursor, 0)
 }
 
 fn tab_complete_fuzzy_filename(
     completion_context: &tab_completion_context::CompletionContext,
-) -> (Vec<UnprocessedSuggestion>, bash_funcs::CompletionFlags) {
+) -> (Vec<UnprocessedSuggestion>, CompletionFlags) {
     let cursor_seg_from_right = completion_context
         .word_right_of_cursor()
         .matches('/')
@@ -799,13 +800,13 @@ fn tab_complete_fuzzy_filename(
 fn tab_complete_fuzzy_filename_impl(
     word_under_cursor: &str,
     cursor_seg_from_right: usize,
-) -> (Vec<UnprocessedSuggestion>, bash_funcs::CompletionFlags) {
-    let mut comp_res_flags = bash_funcs::CompletionFlags::default();
+) -> (Vec<UnprocessedSuggestion>, CompletionFlags) {
+    let mut comp_res_flags = CompletionFlags::default();
     comp_res_flags.filename_quoting_desired = false;
     comp_res_flags.filename_completion_desired = true;
-    comp_res_flags.quote_type = bash_funcs::find_quote_type(word_under_cursor);
+    comp_res_flags.quote_type = crate::bash_funcs::find_quote_type(word_under_cursor);
 
-    let dequoted_wuc = bash_funcs::dequoting_function_rust(word_under_cursor);
+    let dequoted_wuc = crate::bash_funcs::dequoting_function_rust(word_under_cursor);
     let (is_absolute, segments) = split_nonempty_path_segments(&dequoted_wuc);
     if segments.is_empty() {
         return (vec![], comp_res_flags);
@@ -820,7 +821,7 @@ fn tab_complete_fuzzy_filename_impl(
     }
 
     let base_input = path_from_segments(is_absolute, prefix_segments);
-    let expanded_base = PathBuf::from(bash_funcs::fully_expand_path(if base_input.is_empty() {
+    let expanded_base = PathBuf::from(backend().expand_path(if base_input.is_empty() {
         "."
     } else {
         &base_input
@@ -1118,10 +1119,10 @@ impl App<'_> {
 
         if builder.should_run_flycomp {
             let output_dir = self.settings.flycomp_output.as_deref();
-            let dump_path =
-                crate::bash_funcs::resolve_completion_script_path(&command_word, output_dir)
-                    .to_string_lossy()
-                    .into_owned();
+            let dump_path = backend()
+                .resolve_completion_script_path(&command_word, output_dir)
+                .to_string_lossy()
+                .into_owned();
             let sandbox = flycomp::is_sandboxing_available();
 
             self.content_mode = ContentMode::TabCompletionAskForFlycomp {

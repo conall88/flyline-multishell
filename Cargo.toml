@@ -8,7 +8,20 @@ disallowed_methods = "deny"
 
 
 [lib]
-crate-type = ["cdylib"]
+crate-type = ["cdylib", "rlib"]
+
+[[bin]]
+name = "flyline-standalone"
+path = "src/bin/standalone.rs"
+required-features = ["standalone"]
+
+[[test]]
+name = "zsh_completion_tests"
+path = "tests/zsh_completion_tests.rs"
+
+[[test]]
+name = "zsh_integration_tests"
+path = "tests/zsh_integration_tests.rs"
 
 [dependencies]
 clap = { version = "4.6.1", features = ["derive"] }
@@ -50,6 +63,7 @@ flycomp = { git = "https://github.com/HalFrgrd/flycomp.git", rev = "29813f47d0f7
 
 [features]
 pre_bash_4_4 = []
+standalone = []
 
 [dev-dependencies]
 rusty-fork = "0.3.1"

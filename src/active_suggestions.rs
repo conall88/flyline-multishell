@@ -1173,9 +1173,9 @@ impl UnprocessedSuggestion {
 
         if comp_result_flags.filename_completion_desired {
             if path_to_use.is_none() {
-                path_to_use = Some(std::path::PathBuf::from(bash_funcs::fully_expand_path(
-                    &sug,
-                )));
+                path_to_use = Some(std::path::PathBuf::from(
+                    crate::shell::backend().expand_path(&sug),
+                ));
             }
         }
 

@@ -7,8 +7,9 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use crate::content_builder::{ClipboardTypes, Tag, TaggedLine, TaggedSpan};
 use crate::content_utils;
 use crate::palette::Palette;
+use crate::settings;
+use crate::shell::backend;
 use crate::shell_integration;
-use crate::{bash_funcs, settings};
 
 /// Large block-art logo displayed on the welcome screen.
 const LOGO_LINES: &[&str] = &[
@@ -136,8 +137,8 @@ impl TutorialStep {
 /// support the protocol.
 /// TODO: https://sw.kovidgoyal.net/kitty/keyboard-protocol/#detection-of-support-for-this-protocol
 fn detect_kitty_keyboard_support() -> bool {
-    let term = bash_funcs::get_envvar_value("TERM").unwrap_or_default();
-    let term_program = bash_funcs::get_envvar_value("TERM_PROGRAM").unwrap_or_default();
+    let term = backend().env_var("TERM").unwrap_or_default();
+    let term_program = backend().env_var("TERM_PROGRAM").unwrap_or_default();
     let lower_term = term.to_lowercase();
     let lower_program = term_program.to_lowercase();
 
@@ -156,19 +157,22 @@ fn is_vscode() -> bool {
 }
 
 fn is_ghostty() -> bool {
-    let term_program = bash_funcs::get_envvar_value("TERM_PROGRAM").unwrap_or_default();
+    let term_program = backend().env_var("TERM_PROGRAM").unwrap_or_default();
     term_program.to_lowercase().contains("ghostty")
 }
 
 /// Path to the user's Zsh history file (`$HOME/.zsh_history`), if `$HOME` is
 /// set. Returns `None` when no home directory can be determined.
 fn zsh_history_path() -> Option<std::path::PathBuf> {
-    bash_funcs::get_envvar_value("HOME").map(|h| std::path::PathBuf::from(h).join(".zsh_history"))
+    backend()
+        .env_var("HOME")
+        .map(|h| std::path::PathBuf::from(h).join(".zsh_history"))
 }
 
 /// Returns true when the user's default shell (`$SHELL`) ends with `zsh`.
 fn default_shell_is_zsh() -> bool {
-    bash_funcs::get_envvar_value("SHELL")
+    backend()
+        .env_var("SHELL")
         .map(|s| {
             std::path::PathBuf::from(&s)
                 .file_name()
@@ -345,8 +349,8 @@ pub fn generate_tutorial_text(
                 ]));
             }
 
-            let rps1_set = bash_funcs::get_envvar_value("RPS1").is_some_and(|v| !v.is_empty())
-                || bash_funcs::get_envvar_value("RPROMPT").is_some_and(|v| !v.is_empty());
+            let rps1_set = backend().env_var("RPS1").is_some_and(|v| !v.is_empty())
+                || backend().env_var("RPROMPT").is_some_and(|v| !v.is_empty());
 
             if !rps1_set {
                 lines.push(TaggedLine::from_line(Line::from(""), Tag::Tutorial));

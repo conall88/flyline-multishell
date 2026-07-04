@@ -43,7 +43,8 @@ COPY Cargo.toml Cargo.lock build.rs ./
 COPY src ./src
 COPY examples ./examples
 COPY tests ./tests
-RUN cargo build --release ${CARGO_FEATURES:+--features $CARGO_FEATURES}
+RUN cargo build --release ${CARGO_FEATURES:+--features $CARGO_FEATURES} --features standalone --bin flyline-standalone \
+    && cargo build --release ${CARGO_FEATURES:+--features $CARGO_FEATURES}
 
 FROM flyline-builder AS flyline-lib-tests
 ARG CARGO_FEATURES
@@ -54,3 +55,8 @@ RUN cargo test --release ${CARGO_FEATURES:+--features $CARGO_FEATURES} --lib
 # this makes it convenient to copy the built library without creating a container
 FROM scratch AS flyline-built-artifact
 COPY --from=flyline-builder /app/target/release/libflyline.so /libflyline.so
+
+# Zsh integration artifact: lib + standalone editor binary for docker/zsh_integration_test.Dockerfile.
+FROM scratch AS flyline-zsh-integration-artifact
+COPY --from=flyline-builder /app/target/release/libflyline.so /libflyline.so
+COPY --from=flyline-builder /app/target/release/flyline-standalone /flyline-standalone

@@ -278,10 +278,28 @@ pub struct Settings {
     pub initial_buffer: Option<String>,
 }
 
+impl Settings {
+    /// True when flyline runs as the standalone zsh line editor (`FLYLINE_HOST=zsh`).
+    pub fn is_zsh_host() -> bool {
+        crate::shell::is_zsh_host_env()
+    }
+
+    fn default_zsh_history_path() -> Option<String> {
+        if Self::is_zsh_host() {
+            Some(std::env::var("HISTFILE").unwrap_or_else(|_| {
+                let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+                format!("{home}/.zsh_history")
+            }))
+        } else {
+            None
+        }
+    }
+}
+
 impl Default for Settings {
     fn default() -> Self {
         Self {
-            zsh_history_path: None,
+            zsh_history_path: Self::default_zsh_history_path(),
             run_tutorial: false,
             tutorial_step: TutorialStep::default(),
             show_animations: true,

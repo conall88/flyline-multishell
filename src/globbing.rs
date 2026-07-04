@@ -145,7 +145,7 @@ impl PathPatternExpansion {
         let split = split_glob_pattern(pattern);
         let raw_prefix = split.raw_prefix.to_string();
         let rhs_pattern = split.rhs_pattern.to_string();
-        let expanded_prefix = bash_funcs::fully_expand_path(&raw_prefix);
+        let expanded_prefix = crate::shell::backend().expand_path(&raw_prefix);
 
         let rhs_pattern = bash_funcs::dequoting_function_rust(&rhs_pattern);
 
