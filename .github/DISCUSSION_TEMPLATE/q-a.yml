@@ -1,5 +1,3 @@
-name: "Q&A"
-description: Ask a question, suggest an idea, or ask for help.
 title: "[Q&A]: "
 body:
   - type: markdown
@@ -19,7 +17,11 @@ body:
     id: environment
     attributes:
       label: Environment & Version Information (If Relevant)
-      description: Copy version and env info by running `flyline version --copy` in your terminal and pasting it below.
+      description: |
+        Copy version and env info by running this command in your terminal and pasting it below:
+        ```bash
+        flyline version --copy
+        ```
       placeholder: Paste the output of 'flyline version --copy' here...
       render: text
     validations:
