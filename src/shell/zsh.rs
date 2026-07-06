@@ -663,16 +663,33 @@ impl CompDaemon {
 }
 
 /// Parse daemon output between the markers into `(value, description)` pairs.
+///
+/// zsh calls our `compadd` override once per completer/tag, so the same value can
+/// be emitted several times (e.g. `cd` adds each dir under multiple tags). zsh
+/// dedups matches before display; we replicate that here, keeping first-seen order
+/// and the first non-empty description.
 pub fn parse_capture_output(blob: &str) -> Vec<(String, Option<String>)> {
     let mut inside = false;
-    let mut out = Vec::new();
+    let mut out: Vec<(String, Option<String>)> = Vec::new();
+    let mut seen: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
     for line in blob.lines() {
         let line = line.trim_end_matches('\r');
         if line.contains(FLYEND) {
             break;
         }
         if inside && !line.is_empty() {
-            out.push(parse_capture_line(line));
+            let (value, desc) = parse_capture_line(line);
+            match seen.get(&value) {
+                Some(&idx) => {
+                    if out[idx].1.is_none() && desc.is_some() {
+                        out[idx].1 = desc;
+                    }
+                }
+                None => {
+                    seen.insert(value.clone(), out.len());
+                    out.push((value, desc));
+                }
+            }
         }
         if line.contains(FLYBEGIN) {
             inside = true;
@@ -1032,6 +1049,20 @@ mod tests {
     fn parse_capture_output_skips_empty_lines() {
         let blob = "<<FLYBEGIN>>\n\nfoo\n<<FLYEND>>\n";
         assert_eq!(parse_capture_output(blob), vec![("foo".to_string(), None)],);
+    }
+
+    #[test]
+    fn parse_capture_output_dedups_repeated_values() {
+        // `cd` completion emits each dir under several tags; keep first-seen order
+        // and adopt the first non-empty description that appears for a value.
+        let blob = "<<FLYBEGIN>>\nbin\nsrc\nbin\nsrc -- source\nbin\n<<FLYEND>>\n";
+        assert_eq!(
+            parse_capture_output(blob),
+            vec![
+                ("bin".to_string(), None),
+                ("src".to_string(), Some("source".to_string())),
+            ],
+        );
     }
 
     #[test]
