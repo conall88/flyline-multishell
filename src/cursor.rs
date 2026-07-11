@@ -13,7 +13,9 @@ use strum::{AsRefStr, EnumString, VariantArray};
 pub const CURSOR_INTENSITY_UNFOCUSED: u8 = 80;
 
 /// Which backend renders the cursor.
-#[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(
+    ValueEnum, Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize,
+)]
 pub enum CursorBackend {
     /// Flyline renders a custom cursor.
     #[default]
@@ -26,7 +28,19 @@ pub enum CursorBackend {
 ///
 /// Corresponds to the standard easings from the `easing-function` crate:
 /// <https://docs.rs/easing-function/latest/easing_function/easings/index.html>
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, AsRefStr, VariantArray, EnumString)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Default,
+    AsRefStr,
+    VariantArray,
+    EnumString,
+    serde::Serialize,
+    serde::Deserialize,
+)]
 #[strum(serialize_all = "kebab-case")]
 pub enum CursorEasing {
     #[default]
@@ -163,7 +177,9 @@ pub fn cursor_effect_animation_frames(
 }
 
 /// Visual effect applied to the cursor.
-#[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(
+    ValueEnum, Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize,
+)]
 pub enum CursorEffect {
     /// Smoothly oscillate the cursor brightness (default).
     #[default]
@@ -175,7 +191,7 @@ pub enum CursorEffect {
 }
 
 /// How the cursor should be styled.
-#[derive(Debug, Clone, PartialEq, Default)]
+#[derive(Debug, Clone, PartialEq, Default, serde::Serialize, serde::Deserialize)]
 pub enum CursorStyleConfig {
     /// Default: an intensity-modulated grey/white block (original flyline cursor).
     #[default]
@@ -188,7 +204,7 @@ pub enum CursorStyleConfig {
 }
 
 /// Complete cursor configuration set by `flyline set-cursor`.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct CursorConfig {
     /// Which backend renders the cursor.  If `None`, the default is resolved
     /// dynamically based on terminal emulator checks.

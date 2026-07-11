@@ -113,6 +113,21 @@ target "bash-integration-tests-pre-4-4" {
     }
 }
 
+target "extract-zsh-integration-test-build-artifact" {
+    context = "."
+    output = ["type=local,dest=docker/build-zsh-integration-test"]
+    dockerfile = "docker/builder.Dockerfile"
+    target = "flyline-zsh-integration-artifact"
+}
+
+target "zsh-integration-test" {
+    context = "."
+    contexts = {
+        built-artifact = "target:extract-zsh-integration-test-build-artifact"
+    }
+    dockerfile = "docker/zsh_integration_test.Dockerfile"
+}
+
 
 
 

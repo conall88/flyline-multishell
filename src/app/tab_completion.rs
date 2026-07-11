@@ -4,14 +4,15 @@ use std::path::{Path, PathBuf};
 use std::vec;
 
 use crate::active_suggestions::{
-    ActiveSuggestions, ActiveSuggestionsBuilder, ProcessedSuggestion, SuggestionDescription,
-    UnprocessedSuggestion,
+    ActiveSuggestions, ActiveSuggestionsBuilder, FlycompRequest, ProcessedSuggestion,
+    SuggestionDescription, UnprocessedSuggestion,
 };
 use crate::app::{App, ContentMode, FlycompPromptSelection, TabCompletionHandle};
-use crate::bash_funcs::{self, QuoteType};
+use crate::bash_funcs::{CompletionFlags, QuoteType};
 use crate::content_utils::{self, ansi_string_to_spans};
 use crate::globbing::PathPatternExpansion;
 use crate::iter_first_last::FirstLast;
+use crate::shell::{CommandWordInfo, backend};
 use crate::tab_completion_context::CompType;
 use crate::text_buffer::SubString;
 use crate::users;
@@ -52,7 +53,7 @@ fn run_comp_spec_completion(
     completion_context: &tab_completion_context::CompletionContext,
     initial_command_word: &str,
 ) -> Option<ActiveSuggestionsBuilder> {
-    let poss_alias = bash_funcs::find_alias(initial_command_word);
+    let poss_alias = backend().find_alias(initial_command_word);
     log::debug!(
         "Checking for alias for command word '{}': {:?}",
         initial_command_word,
@@ -81,7 +82,7 @@ fn run_comp_spec_completion(
     if alias_expanded_command_word == "flyline" {
         run_flyline_compspec(alias_expanded_completion_context)
     } else {
-        let poss_completions = bash_funcs::run_programmable_completions(
+        let poss_completions = backend().run_programmable_completions(
             alias_expanded_full_command,
             &alias_expanded_command_word,
             alias_expanded_word_under_cursor,
@@ -132,7 +133,7 @@ fn run_flyline_compspec(
     // attached to each candidate) are preserved as-is.
     match complete_flyline_args(full_command, word_under_cursor, cursor_byte_pos) {
         Ok(candidates) => {
-            let quote_type = bash_funcs::find_quote_type(word_under_cursor);
+            let quote_type = crate::bash_funcs::find_quote_type(word_under_cursor);
 
             let processed: Vec<ProcessedSuggestion> = candidates
                 .into_iter()
@@ -155,7 +156,7 @@ fn run_flyline_compspec(
                         (value, " ")
                     };
                     let value = if let Some(qt) = quote_type {
-                        bash_funcs::quoting_function_rust(&value, qt, true, false)
+                        crate::bash_funcs::quoting_function_rust(&value, qt, true, false)
                     } else {
                         value
                     };
@@ -199,16 +200,126 @@ fn run_flyline_compspec(
 /// Under `cfg(test)` we always force full processing (regardless of how big
 /// the queue is) and always populate the common prefix, so that test
 /// expectations are deterministic.
+/// Whether the flycomp "synthesize completions" prompt may fire for the current
+/// tab-completion attempt, split by the reason so the `CommandComp` arm can
+/// apply each independently.
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct FlycompGate {
+    /// The command has no useful native completer at all (missing / `_minimal`),
+    /// and the word is completable by flycomp (empty or option-shaped). This is
+    /// the long-standing behaviour.
+    pub when_no_completer: bool,
+    /// A native completer *is* registered but returned nothing for an
+    /// option-shaped word (`-`/`--`); offer to synthesize options from `--help`
+    /// anyway. Gated by the `flycomp_synthesize_options` setting.
+    pub when_empty_options: bool,
+}
+
+/// Decide when the flycomp prompt may fire, from the user settings and the shape
+/// of the word under the cursor. Pure so it can be unit-tested without an `App`.
+///
+/// The key distinction is empty vs. option-shaped word: an empty word with a
+/// registered completer is contextual (stay silent, like `kubectl get`), while a
+/// bare `-`/`--` that a completer can't complete signals it may not know the
+/// tool's options, so synthesizing from `--help` is worthwhile.
+pub(crate) fn compute_flycomp_gate(
+    use_flycomp: bool,
+    command_blacklisted: bool,
+    auto_started: bool,
+    word_under_cursor: &str,
+    option_candidate: bool,
+    synthesize_options: bool,
+) -> FlycompGate {
+    // flycomp is only ever offered on a manual Tab for a non-blacklisted command
+    // with the feature enabled.
+    let common = use_flycomp && !command_blacklisted && !auto_started;
+    let wuc_is_bare_dash =
+        !word_under_cursor.is_empty() && word_under_cursor.chars().all(|c| c == '-');
+    FlycompGate {
+        when_no_completer: common && (word_under_cursor.is_empty() || wuc_is_bare_dash),
+        when_empty_options: common && option_candidate && synthesize_options,
+    }
+}
+
+fn flycomp_request_for_native_result(
+    compspec_was_useful: Option<bool>,
+    native_results_empty: bool,
+    gate: FlycompGate,
+) -> Option<FlycompRequest> {
+    if compspec_was_useful == Some(false) && gate.when_no_completer {
+        Some(FlycompRequest::InstallCompletionScript)
+    } else if compspec_was_useful == Some(true) && native_results_empty && gate.when_empty_options {
+        Some(FlycompRequest::SuggestOptions)
+    } else {
+        None
+    }
+}
+
+/// Whether the word under the cursor is an option-name candidate rather than a
+/// filename or an option value.
+///
+/// A previous standalone `--` ends option parsing, while an `=` before the
+/// cursor means the user is completing the value half of `--option=value`.
+fn is_option_candidate(completion_context: &tab_completion_context::CompletionContext) -> bool {
+    let word_under_cursor = completion_context.word_under_cursor.as_ref();
+    if !word_under_cursor.starts_with('-') || completion_context.word_left_of_cursor().contains('=')
+    {
+        return false;
+    }
+
+    let before_word = context_before_word(completion_context);
+    let Some(previous_words) = shlex::split(before_word) else {
+        return false;
+    };
+    !previous_words.iter().any(|word| word == "--")
+}
+
+fn context_before_word<'a>(
+    completion_context: &'a tab_completion_context::CompletionContext<'_>,
+) -> &'a str {
+    let relative_start = completion_context
+        .word_under_cursor
+        .start
+        .saturating_sub(completion_context.context.start)
+        .min(completion_context.context.as_ref().len());
+    &completion_context.context.as_ref()[..relative_start]
+}
+
+fn resolve_flycomp_command(command_word: &str) -> String {
+    let alias = backend().find_alias(command_word);
+    let alias_def = alias
+        .as_deref()
+        .filter(|alias| !alias.is_empty())
+        .unwrap_or(command_word);
+    let mut resolved = alias_def
+        .split_whitespace()
+        .next()
+        .unwrap_or(alias_def)
+        .to_string();
+    if resolved.starts_with('~') || resolved.contains('/') {
+        let expanded = backend().expand_path(&resolved);
+        if !expanded.is_empty() {
+            resolved = expanded;
+        }
+    }
+    resolved
+}
+
+fn resolve_flycomp_option_identity(command_word: &str) -> String {
+    let resolved = resolve_flycomp_command(command_word);
+    if let CommandWordInfo::File { path, .. } = backend().command_info(&resolved) {
+        path
+    } else {
+        resolved
+    }
+}
+
 pub(crate) fn gen_completions_internal(
     completion_context: &tab_completion_context::CompletionContext,
     auto_started: bool,
-    will_run_flycomp_if_prog_comp_is_useless: bool,
+    flycomp_gate: FlycompGate,
 ) -> Option<ActiveSuggestionsBuilder> {
-    let mut builder = gen_completions_uncomitted(
-        completion_context,
-        auto_started,
-        will_run_flycomp_if_prog_comp_is_useless,
-    )?;
+    let mut builder = gen_completions_uncomitted(completion_context, auto_started, flycomp_gate)?;
 
     let all_processed = if cfg!(test) {
         // Tests demand determinism: process everything and always compute
@@ -233,11 +344,12 @@ pub(crate) fn gen_completions_internal(
 fn gen_completions_uncomitted(
     completion_context: &tab_completion_context::CompletionContext,
     auto_started: bool,
-    will_run_flycomp_if_prog_comp_is_useless: bool,
+    flycomp_gate: FlycompGate,
 ) -> Option<ActiveSuggestionsBuilder> {
     log::debug!("Completion context: {:#?}", completion_context);
 
     let word_under_cursor = &completion_context.word_under_cursor;
+    let option_candidate = is_option_candidate(completion_context);
 
     for comp_type in &completion_context.comp_types() {
         log::debug!("Processing completion type: {:?}", comp_type);
@@ -292,12 +404,41 @@ fn gen_completions_uncomitted(
                         builder.len(),
                         initial_command_word
                     );
-                    if builder.compspec_was_useful == Some(false)
-                        && will_run_flycomp_if_prog_comp_is_useless
-                    {
-                        builder.should_run_flycomp = true;
+                    // No useful native completer at all: offer flycomp for an
+                    // empty or option-shaped word (long-standing behaviour).
+                    builder.flycomp_request = flycomp_request_for_native_result(
+                        builder.compspec_was_useful,
+                        builder.is_empty(),
+                        flycomp_gate,
+                    );
+                    if builder.flycomp_request == Some(FlycompRequest::SuggestOptions) {
+                        let command_identity =
+                            resolve_flycomp_option_identity(initial_command_word);
+                        if let Some(model) =
+                            crate::flycomp_options::load_cached_model(&command_identity)
+                        {
+                            log::debug!(
+                                "Using cached flycomp option model for '{}'",
+                                command_identity
+                            );
+                            builder = crate::flycomp_options::suggestions_from_model(
+                                &model,
+                                context_before_word(completion_context),
+                                word_under_cursor.as_ref(),
+                            )
+                            .with_compspec_was_useful(Some(true));
+                        } else {
+                            builder.flycomp_request = Some(FlycompRequest::SuggestOptions);
+                        }
                     }
-                    if !builder.is_empty() || builder.should_run_flycomp {
+                    log::debug!(
+                        "CommandComp decision: is_empty={}, compspec_was_useful={:?}, gate={:?}, flycomp_request={:?}",
+                        builder.is_empty(),
+                        builder.compspec_was_useful,
+                        flycomp_gate,
+                        builder.flycomp_request,
+                    );
+                    if !builder.is_empty() || builder.flycomp_request.is_some() {
                         return Some(builder.with_comp_type(comp_type.clone()));
                     }
                 }
@@ -374,7 +515,7 @@ fn gen_completions_uncomitted(
             CompType::EnvVariable => {
                 log::debug!("CompType::EnvVariable for {}", word_under_cursor.as_ref());
                 let matching_vars =
-                    bash_funcs::get_all_variables_with_prefix(word_under_cursor.as_ref());
+                    crate::shell::backend().vars_with_prefix(word_under_cursor.as_ref());
                 log::debug!(
                     "CompType::EnvVariable found {} completions for prefix: {}",
                     matching_vars.len(),
@@ -495,6 +636,12 @@ fn gen_completions_uncomitted(
                 }
             }
             CompType::FilenameExpansion => {
+                if option_candidate {
+                    log::debug!(
+                        "Skipping FilenameExpansion because word under cursor is an option candidate"
+                    );
+                    continue;
+                }
                 if auto_started && word_under_cursor.as_ref().trim().is_empty() {
                     log::debug!(
                         "Skipping FilenameExpansion because auto_started is true and word_under_cursor is empty"
@@ -528,6 +675,12 @@ fn gen_completions_uncomitted(
                 }
             }
             CompType::FuzzyFilenameExpansion => {
+                if option_candidate {
+                    log::debug!(
+                        "Skipping FuzzyFilenameExpansion because word under cursor is an option candidate"
+                    );
+                    continue;
+                }
                 if auto_started && word_under_cursor.as_ref().trim().is_empty() {
                     log::debug!(
                         "Skipping FuzzyFilenameExpansion because auto_started is true and word_under_cursor is empty"
@@ -604,7 +757,7 @@ fn tab_complete_first_word(command: &str, word_under_cursor: &str) -> ActiveSugg
 
     let mut res = vec![];
     let mut seen: HashSet<String> = HashSet::new();
-    for poss_info in bash_funcs::get_possible_command_words() {
+    for poss_info in backend().possible_command_words() {
         let cmd_name = poss_info.command();
         if cmd_name.starts_with(command) && seen.insert(cmd_name.to_string()) {
             res.push(poss_info);
@@ -624,7 +777,7 @@ fn tab_complete_first_word(command: &str, word_under_cursor: &str) -> ActiveSugg
 }
 
 fn processed_suggestions_from_command_info(
-    command_infos: Vec<bash_funcs::CommandWordInfo>,
+    command_infos: Vec<CommandWordInfo>,
 ) -> Vec<ProcessedSuggestion> {
     command_infos
         .into_iter()
@@ -636,7 +789,7 @@ fn processed_suggestions_from_command_info(
                 " ".to_string()
             };
             let description_str = info.to_description();
-            let description = if matches!(info, bash_funcs::CommandWordInfo::Unknown { .. }) {
+            let description = if matches!(info, CommandWordInfo::Unknown { .. }) {
                 SuggestionDescription::Static(vec![])
             } else {
                 SuggestionDescription::Static(vec![ratatui::text::Span::raw(description_str)])
@@ -662,7 +815,7 @@ fn tab_complete_fuzzy_first_word(command: &str) -> ActiveSuggestionsBuilder {
     let mut scored = vec![];
 
     let mut seen: HashSet<String> = HashSet::new();
-    for poss_info in bash_funcs::get_possible_command_words() {
+    for poss_info in backend().possible_command_words() {
         let cmd_name = poss_info.command();
         if seen.insert(cmd_name.to_string())
             && let Some(score) = content_utils::fuzzy_match_with_threshold(
@@ -687,7 +840,7 @@ fn tab_complete_fuzzy_first_word(command: &str) -> ActiveSuggestionsBuilder {
 /// `should_skip_hidden`: If true, skip files starting with `.` (unless pattern explicitly requests them).
 fn tab_complete_with_expanded_pattern(
     expanded: &PathPatternExpansion,
-    comp_resultflags: bash_funcs::CompletionFlags,
+    comp_resultflags: CompletionFlags,
     wuc: &str,
     should_skip_hidden: bool,
 ) -> Vec<UnprocessedSuggestion> {
@@ -755,8 +908,8 @@ fn tab_complete_with_expanded_pattern(
 fn tab_complete_glob_expansion(
     pattern: &str,
     word_under_cursor: &str,
-) -> (Vec<UnprocessedSuggestion>, bash_funcs::CompletionFlags) {
-    let mut comp_resultflags = bash_funcs::CompletionFlags::default();
+) -> (Vec<UnprocessedSuggestion>, CompletionFlags) {
+    let mut comp_resultflags = CompletionFlags::default();
     // We will handle it ourselves because the prefix should not be quoted but the found filename should be.
     // e.g. my_command $PWD/fi<TAB> should expand to:
     // my_command $PWD/file\ with\ spaces.txt
@@ -765,7 +918,7 @@ fn tab_complete_glob_expansion(
     comp_resultflags.filename_quoting_desired = false;
     comp_resultflags.filename_completion_desired = true;
 
-    comp_resultflags.quote_type = bash_funcs::find_quote_type(pattern);
+    comp_resultflags.quote_type = crate::bash_funcs::find_quote_type(pattern);
     log::debug!("found quote type: {:?}", comp_resultflags.quote_type);
 
     let expanded = PathPatternExpansion::new(pattern);
@@ -783,13 +936,13 @@ fn tab_complete_glob_expansion(
 /// but the fuzzy matcher will.
 fn tab_complete_fuzzy_filename_from_word(
     word_under_cursor: &str,
-) -> (Vec<UnprocessedSuggestion>, bash_funcs::CompletionFlags) {
+) -> (Vec<UnprocessedSuggestion>, CompletionFlags) {
     tab_complete_fuzzy_filename_impl(word_under_cursor, 0)
 }
 
 fn tab_complete_fuzzy_filename(
     completion_context: &tab_completion_context::CompletionContext,
-) -> (Vec<UnprocessedSuggestion>, bash_funcs::CompletionFlags) {
+) -> (Vec<UnprocessedSuggestion>, CompletionFlags) {
     let cursor_seg_from_right = completion_context
         .word_right_of_cursor()
         .matches('/')
@@ -803,13 +956,13 @@ fn tab_complete_fuzzy_filename(
 fn tab_complete_fuzzy_filename_impl(
     word_under_cursor: &str,
     cursor_seg_from_right: usize,
-) -> (Vec<UnprocessedSuggestion>, bash_funcs::CompletionFlags) {
-    let mut comp_res_flags = bash_funcs::CompletionFlags::default();
+) -> (Vec<UnprocessedSuggestion>, CompletionFlags) {
+    let mut comp_res_flags = CompletionFlags::default();
     comp_res_flags.filename_quoting_desired = false;
     comp_res_flags.filename_completion_desired = true;
-    comp_res_flags.quote_type = bash_funcs::find_quote_type(word_under_cursor);
+    comp_res_flags.quote_type = crate::bash_funcs::find_quote_type(word_under_cursor);
 
-    let dequoted_wuc = bash_funcs::dequoting_function_rust(word_under_cursor);
+    let dequoted_wuc = crate::bash_funcs::dequoting_function_rust(word_under_cursor);
     let (is_absolute, segments) = split_nonempty_path_segments(&dequoted_wuc);
     if segments.is_empty() {
         return (vec![], comp_res_flags);
@@ -824,7 +977,7 @@ fn tab_complete_fuzzy_filename_impl(
     }
 
     let base_input = path_from_segments(is_absolute, prefix_segments);
-    let expanded_base = PathBuf::from(bash_funcs::fully_expand_path(if base_input.is_empty() {
+    let expanded_base = PathBuf::from(backend().expand_path(if base_input.is_empty() {
         "."
     } else {
         &base_input
@@ -1120,17 +1273,33 @@ impl App<'_> {
             .unwrap_or("")
             .to_string();
 
-        if builder.should_run_flycomp {
-            let output_dir = self.settings.flycomp_output.as_deref();
-            let dump_path =
-                crate::bash_funcs::resolve_completion_script_path(&command_word, output_dir)
-                    .to_string_lossy()
-                    .into_owned();
+        if let Some(request) = builder.flycomp_request {
+            let dump_path = if request == FlycompRequest::InstallCompletionScript {
+                let output_dir = self.settings.flycomp_output.as_deref();
+                Some(
+                    backend()
+                        .resolve_completion_script_path(&command_word, output_dir)
+                        .to_string_lossy()
+                        .into_owned(),
+                )
+            } else {
+                None
+            };
             let sandbox = flycomp::is_sandboxing_available();
+            let command_identity = match request {
+                FlycompRequest::InstallCompletionScript => resolve_flycomp_command(&command_word),
+                FlycompRequest::SuggestOptions => resolve_flycomp_option_identity(&command_word),
+            };
+            let context_before_word = context_before_word(&completion_context).to_string();
+            let buffer_snapshot = self.buffer.buffer().to_string();
 
             self.content_mode = ContentMode::TabCompletionAskForFlycomp {
                 command_word,
+                command_identity,
                 word_under_cursor: wuc_substring.s.clone(),
+                context_before_word,
+                buffer_snapshot,
+                request,
                 selection: FlycompPromptSelection::Yes,
                 sandbox,
                 dump_path,
@@ -1223,10 +1392,24 @@ impl App<'_> {
             .next()
             .unwrap_or("")
             .to_string();
-        let will_run_flycomp_if_prog_comp_is_useless = self.settings.use_flycomp
-            && !self.settings.flycomp_blacklist.contains(&command_word)
-            && !auto_started
-            && (wuc_substring.s.is_empty() || wuc_substring.s.chars().all(|c| c == '-'));
+        let flycomp_gate = compute_flycomp_gate(
+            self.settings.use_flycomp,
+            self.settings.flycomp_blacklist.contains(&command_word),
+            auto_started,
+            &wuc_substring.s,
+            is_option_candidate(&completion_context_owned),
+            self.settings.flycomp_synthesize_options,
+        );
+        log::debug!(
+            "start_tab_complete: cmd='{}', wuc='{}', auto_started={}, use_flycomp={}, synthesize_options={}, gate={:?}, comp_types={:?}",
+            command_word,
+            wuc_substring.s,
+            auto_started,
+            self.settings.use_flycomp,
+            self.settings.flycomp_synthesize_options,
+            flycomp_gate,
+            completion_context_owned.comp_types(),
+        );
 
         let start_time = std::time::Instant::now();
 
@@ -1275,11 +1458,8 @@ impl App<'_> {
                 }
             }
             let thread_start = std::time::Instant::now();
-            let result = gen_completions_internal(
-                &completion_context_owned,
-                auto_started,
-                will_run_flycomp_if_prog_comp_is_useless,
-            );
+            let result =
+                gen_completions_internal(&completion_context_owned, auto_started, flycomp_gate);
             let elapsed = thread_start.elapsed();
 
             log::info!("Child process completed");
@@ -1422,6 +1602,96 @@ mod tab_completion_tests {
 
     const MANIFEST_DIR: &str = env!("CARGO_MANIFEST_DIR");
 
+    #[test]
+    fn flycomp_gate_option_word_offers_synthesis_when_enabled() {
+        // `grep --`: a native completer may exist but return nothing; with the
+        // toggle on we still offer to synthesize options.
+        let gate = compute_flycomp_gate(true, false, false, "--", true, true);
+        assert!(gate.when_empty_options);
+        assert!(gate.when_no_completer);
+
+        // Single dash is also option-shaped.
+        assert!(compute_flycomp_gate(true, false, false, "-", true, true).when_empty_options);
+    }
+
+    #[test]
+    fn flycomp_gate_option_word_respects_toggle() {
+        // Same `grep --`, but synthesis toggled off: no option offer, though the
+        // no-completer-at-all path is unaffected.
+        let gate = compute_flycomp_gate(true, false, false, "--", true, false);
+        assert!(!gate.when_empty_options);
+        assert!(gate.when_no_completer);
+    }
+
+    #[test]
+    fn flycomp_gate_empty_word_never_offers_options() {
+        // `kubectl get ` (empty word): an empty native result is contextual, so
+        // we never offer option synthesis regardless of the toggle.
+        let gate = compute_flycomp_gate(true, false, false, "", false, true);
+        assert!(!gate.when_empty_options);
+        assert!(gate.when_no_completer);
+    }
+
+    #[test]
+    fn flycomp_gate_disabled_paths() {
+        // Non-option, non-empty word: nothing offered.
+        let normal = compute_flycomp_gate(true, false, false, "foo", false, true);
+        assert!(!normal.when_empty_options);
+        assert!(!normal.when_no_completer);
+
+        // Auto-started (typing, not a manual Tab): never offer.
+        let auto = compute_flycomp_gate(true, false, true, "--", true, true);
+        assert!(!auto.when_empty_options);
+        assert!(!auto.when_no_completer);
+
+        // Blacklisted command: never offer.
+        let blacklisted = compute_flycomp_gate(true, true, false, "--", true, true);
+        assert!(!blacklisted.when_empty_options);
+        assert!(!blacklisted.when_no_completer);
+
+        // flycomp disabled entirely: never offer.
+        let off = compute_flycomp_gate(false, false, false, "--", true, true);
+        assert!(!off.when_empty_options);
+        assert!(!off.when_no_completer);
+    }
+
+    #[test]
+    fn option_candidate_is_conservative_about_values_and_end_marker() {
+        let candidate = |buffer: &str| {
+            let context = get_completion_context(buffer, buffer.len());
+            is_option_candidate(&context)
+        };
+
+        assert!(candidate("grep --"));
+        assert!(candidate("grep --col"));
+        assert!(candidate("grep -5"));
+        assert!(!candidate("grep "));
+        assert!(!candidate("grep pattern"));
+        assert!(!candidate("cat -- -filename"));
+        assert!(!candidate("tool --config=./file"));
+    }
+
+    #[test]
+    fn flycomp_request_preserves_install_and_requires_registered_empty_for_options() {
+        let gate = FlycompGate {
+            when_no_completer: true,
+            when_empty_options: true,
+        };
+        assert_eq!(
+            flycomp_request_for_native_result(Some(false), true, gate),
+            Some(FlycompRequest::InstallCompletionScript)
+        );
+        assert_eq!(
+            flycomp_request_for_native_result(Some(true), true, gate),
+            Some(FlycompRequest::SuggestOptions)
+        );
+        assert_eq!(
+            flycomp_request_for_native_result(Some(true), false, gate),
+            None
+        );
+        assert_eq!(flycomp_request_for_native_result(None, true, gate), None);
+    }
+
     /// Locate a test fixture directory by trying multiple paths:
     /// 1. Relative path from current working directory (works in most test runners)
     /// 2. Path relative to CARGO_MANIFEST_DIR (works in some Docker builds)
@@ -1462,7 +1732,8 @@ mod tab_completion_tests {
     ) -> Option<(ActiveSuggestionsBuilder, CompletionContext<'static>)> {
         crate::logging::init_for_tests_once();
         let comp_context = get_completion_context(buffer.buffer(), buffer.cursor_byte_pos());
-        let Some(builder) = gen_completions_internal(&comp_context, false, false) else {
+        let Some(builder) = gen_completions_internal(&comp_context, false, FlycompGate::default())
+        else {
             return None;
         };
         Some((builder, comp_context.into_owned()))
@@ -1724,7 +1995,8 @@ mod tab_completion_tests {
             let comp_context =
                 get_completion_context(buffer.buffer(), buffer.cursor_byte_pos());
             let wuc = comp_context.word_under_cursor.clone();
-            let builder = gen_completions_internal(&comp_context, false, false).expect("some completions");
+            let builder = gen_completions_internal(&comp_context, false, FlycompGate::default())
+                .expect("some completions");
             assert_eq!(builder.comp_type, CompType::CommandComp { command_word: "gd".to_string() });
             assert_eq!(builder.len(), 1, "expected solo suggestion, got {:?}", builder.processed);
             let outcome = apply_tab_complete_to_buffer(&mut buffer, &builder, &wuc);

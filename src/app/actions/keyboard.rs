@@ -6,6 +6,7 @@ use crate::text_buffer::WordDelim;
 use anyhow::Result;
 use clap_complete::CompletionCandidate;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::HashMap;
 use std::io::IsTerminal;
 use std::ops::Add;
@@ -224,6 +225,21 @@ pub enum KeyEventAction {
     InsertString(String),
 }
 
+/// Serialized as its camelCase action name (via strum), never as a struct.
+impl Serialize for KeyEventAction {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for KeyEventAction {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(deserializer)?;
+        KeyEventAction::try_from(s.as_str())
+            .map_err(|_| serde::de::Error::custom(format!("unknown action: '{s}'")))
+    }
+}
+
 impl KeyEventAction {
     /// The camelCase action name as exposed in the CLI.
     pub fn as_str(&self) -> &'static str {
@@ -314,7 +330,11 @@ impl KeyEventAction {
                 let mode = std::mem::replace(&mut app.content_mode, ContentMode::Normal);
                 if let ContentMode::TabCompletionAskForFlycomp {
                     command_word,
+                    command_identity,
                     word_under_cursor,
+                    context_before_word,
+                    buffer_snapshot,
+                    request,
                     selection,
                     sandbox,
                     ..
@@ -322,7 +342,15 @@ impl KeyEventAction {
                 {
                     match selection {
                         FlycompPromptSelection::Yes => {
-                            app.run_flycomp(command_word, word_under_cursor, sandbox.is_some());
+                            app.run_flycomp(
+                                command_word,
+                                command_identity,
+                                word_under_cursor,
+                                context_before_word,
+                                buffer_snapshot,
+                                request,
+                                sandbox.is_some(),
+                            );
                         }
                         FlycompPromptSelection::No => {}
                         FlycompPromptSelection::DontAsk => {
@@ -506,6 +534,11 @@ impl KeyEventAction {
                     app.settings
                         .cancelled_command_history_manager
                         .push_entry(buf.to_string());
+                }
+                // Cancelling during the tutorial ends it, rather than letting it
+                // resume on the next prompt.
+                if app.settings.tutorial_step.is_active() {
+                    app.settings.stop_tutorial();
                 }
                 app.mode =
                     crate::app::AppRunningState::Exiting(crate::app::ExitState::WithoutCommand);
@@ -1044,6 +1077,41 @@ impl TryFrom<&str> for KeyEventMatch {
     }
 }
 
+impl KeyEventMatch {
+    /// Canonical, human-readable string form (e.g. `ctrl+s`, `alt+enter`,
+    /// `ctrl+anychar`).  Exact inverse of [`TryFrom<&str>`]: for every key the
+    /// parser accepts, `KeyEventMatch::try_from(&kem.to_key_string()) == Ok(kem)`.
+    pub fn to_key_string(&self) -> String {
+        let mut mods: Vec<&'static str> = Vec::new();
+        let tail = match self {
+            KeyEventMatch::Exact(ev) => {
+                push_modifier_strs(ev.modifiers, &mut mods);
+                keycode_to_string(ev.code)
+            }
+            KeyEventMatch::AnyCharAndMods(m) => {
+                push_modifier_strs(*m, &mut mods);
+                "anychar".to_string()
+            }
+        };
+        let mut parts: Vec<String> = mods.into_iter().map(String::from).collect();
+        parts.push(tail);
+        parts.join("+")
+    }
+}
+
+impl Serialize for KeyEventMatch {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.to_key_string())
+    }
+}
+
+impl<'de> Deserialize<'de> for KeyEventMatch {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(deserializer)?;
+        KeyEventMatch::try_from(s.as_str()).map_err(serde::de::Error::custom)
+    }
+}
+
 /// A key code remapping or modifier remapping registered with `flyline key remap`.
 ///
 /// Keys can only be remapped to keys, and modifiers can only be remapped to
@@ -1060,6 +1128,43 @@ pub enum KeyRemap {
     },
     /// Remap a key event with modifiers to another key event.
     Event { from: KeyEvent, to: KeyEvent },
+}
+
+/// Human-readable serialized form of a [`KeyRemap`], e.g. `{"from":"tab","to":"z"}`
+/// or `{"from":"alt","to":"ctrl"}`.  The variant is recovered on load by
+/// [`try_parse_remap`], which detects modifier names vs key names (their name
+/// spaces do not overlap).
+#[derive(Serialize, Deserialize)]
+struct KeyRemapRepr {
+    from: String,
+    to: String,
+}
+
+impl Serialize for KeyRemap {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let repr = match self {
+            KeyRemap::Key { from, to } => KeyRemapRepr {
+                from: keycode_to_string(*from),
+                to: keycode_to_string(*to),
+            },
+            KeyRemap::Modifier { from, to } => KeyRemapRepr {
+                from: modifiers_to_string(*from),
+                to: modifiers_to_string(*to),
+            },
+            KeyRemap::Event { from, to } => KeyRemapRepr {
+                from: KeyEventMatch::Exact(*from).to_key_string(),
+                to: KeyEventMatch::Exact(*to).to_key_string(),
+            },
+        };
+        repr.serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for KeyRemap {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let repr = KeyRemapRepr::deserialize(deserializer)?;
+        try_parse_remap(&repr.from, &repr.to).map_err(serde::de::Error::custom)
+    }
 }
 
 /// Parse a single key-code name (no modifiers) into a [`KeyCode`].
@@ -1181,6 +1286,117 @@ fn parse_single_modifier(s: &str) -> Result<KeyModifiers> {
         .ok_or_else(|| anyhow::anyhow!("Unknown modifier: '{}'", s))
 }
 
+/// Modifier bits in a stable display order, each paired with its canonical
+/// (first-accepted) spelling from [`MODS_TO_EQUIV_NAMES`].  This is the inverse
+/// of [`parse_single_modifier`]: `parse_single_modifier(name)? == bit`.
+const CANONICAL_MODIFIERS: &[(KeyModifiers, &str)] = &[
+    (KeyModifiers::CONTROL, "ctrl"),
+    (KeyModifiers::SHIFT, "shift"),
+    (KeyModifiers::ALT, "alt"),
+    (KeyModifiers::META, "meta"),
+    (KeyModifiers::SUPER, "super"),
+    (KeyModifiers::HYPER, "hyper"),
+];
+
+/// Append the canonical names of every set bit in `mods` to `out`, in the
+/// stable order defined by [`CANONICAL_MODIFIERS`].
+fn push_modifier_strs(mods: KeyModifiers, out: &mut Vec<&'static str>) {
+    for (bit, name) in CANONICAL_MODIFIERS {
+        if mods.contains(*bit) {
+            out.push(name);
+        }
+    }
+}
+
+/// Canonical `+`-joined string for a [`KeyModifiers`] value (used by remap
+/// serialization, where `from`/`to` are single modifier bits).
+fn modifiers_to_string(mods: KeyModifiers) -> String {
+    let mut parts = Vec::new();
+    push_modifier_strs(mods, &mut parts);
+    parts.join("+")
+}
+
+/// Canonical name for a media key, inverse of the `media:` arm of
+/// [`parse_single_keycode`].
+fn media_key_name(mk: crossterm::event::MediaKeyCode) -> &'static str {
+    use crossterm::event::MediaKeyCode;
+    match mk {
+        MediaKeyCode::Play => "play",
+        MediaKeyCode::Pause => "pause",
+        MediaKeyCode::PlayPause => "playpause",
+        MediaKeyCode::Reverse => "reverse",
+        MediaKeyCode::Stop => "stop",
+        MediaKeyCode::FastForward => "fastforward",
+        MediaKeyCode::Rewind => "rewind",
+        MediaKeyCode::TrackNext => "tracknext",
+        MediaKeyCode::TrackPrevious => "trackprevious",
+        MediaKeyCode::Record => "record",
+        MediaKeyCode::LowerVolume => "lowervolume",
+        MediaKeyCode::RaiseVolume => "raisevolume",
+        MediaKeyCode::MuteVolume => "mutevolume",
+    }
+}
+
+/// Canonical name for a standalone modifier key, inverse of the `modifier:` arm
+/// of [`parse_single_keycode`].
+fn modifier_key_name(mk: crossterm::event::ModifierKeyCode) -> &'static str {
+    use crossterm::event::ModifierKeyCode;
+    match mk {
+        ModifierKeyCode::LeftShift => "leftshift",
+        ModifierKeyCode::LeftControl => "leftcontrol",
+        ModifierKeyCode::LeftAlt => "leftalt",
+        ModifierKeyCode::LeftSuper => "leftsuper",
+        ModifierKeyCode::LeftHyper => "lefthyper",
+        ModifierKeyCode::LeftMeta => "leftmeta",
+        ModifierKeyCode::RightShift => "rightshift",
+        ModifierKeyCode::RightControl => "rightcontrol",
+        ModifierKeyCode::RightAlt => "rightalt",
+        ModifierKeyCode::RightSuper => "rightsuper",
+        ModifierKeyCode::RightHyper => "righthyper",
+        ModifierKeyCode::RightMeta => "rightmeta",
+        ModifierKeyCode::IsoLevel3Shift => "isolevel3shift",
+        ModifierKeyCode::IsoLevel5Shift => "isolevel5shift",
+    }
+}
+
+/// Canonical, human-readable string for a [`KeyCode`], the exact inverse of
+/// [`parse_single_keycode`] for every code that parser can produce.
+fn keycode_to_string(code: KeyCode) -> String {
+    match code {
+        // A literal space cannot round-trip as a single char (the parser trims
+        // whitespace first), so it uses the named form.
+        KeyCode::Char(' ') => "space".to_string(),
+        // The parser lower-cases single ASCII letters, so mirror that here.
+        KeyCode::Char(c) => c.to_ascii_lowercase().to_string(),
+        KeyCode::F(n) => format!("f{n}"),
+        KeyCode::Media(mk) => format!("media:{}", media_key_name(mk)),
+        KeyCode::Modifier(mk) => format!("modifier:{}", modifier_key_name(mk)),
+        KeyCode::Enter => "enter".to_string(),
+        KeyCode::Backspace => "backspace".to_string(),
+        KeyCode::Left => "left".to_string(),
+        KeyCode::Right => "right".to_string(),
+        KeyCode::Up => "up".to_string(),
+        KeyCode::Down => "down".to_string(),
+        KeyCode::Home => "home".to_string(),
+        KeyCode::End => "end".to_string(),
+        KeyCode::PageUp => "pageup".to_string(),
+        KeyCode::PageDown => "pagedown".to_string(),
+        KeyCode::Tab => "tab".to_string(),
+        KeyCode::BackTab => "backtab".to_string(),
+        KeyCode::Delete => "delete".to_string(),
+        KeyCode::Insert => "insert".to_string(),
+        KeyCode::Esc => "esc".to_string(),
+        KeyCode::Null => "null".to_string(),
+        KeyCode::CapsLock => "capslock".to_string(),
+        KeyCode::ScrollLock => "scrolllock".to_string(),
+        KeyCode::NumLock => "numlock".to_string(),
+        KeyCode::PrintScreen => "printscreen".to_string(),
+        KeyCode::Pause => "pause".to_string(),
+        KeyCode::Menu => "menu".to_string(),
+        KeyCode::KeypadBegin => "keypadbegin".to_string(),
+    }
+}
+
 /// Parse and validate a remap pair (from, to).  Modifiers may only be remapped
 /// to modifiers; keys may only be remapped to keys.
 pub fn try_parse_remap(from: &str, to: &str) -> Result<KeyRemap> {
@@ -1286,11 +1502,104 @@ pub fn apply_remappings(key: KeyEvent, remappings: &[KeyRemap]) -> KeyEvent {
     KeyEvent::new(new_code, new_modifiers)
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Binding {
     key_events: Vec<KeyEventMatch>,
     context: ContextExpr,
     actions: Vec<KeyEventAction>,
+}
+
+/// Default context for a binding whose serialized form omits the `context`
+/// field: the unconditional `always` context.
+fn default_binding_context() -> ContextExpr {
+    ContextExpr::from(ContextVar::Always)
+}
+
+/// Parse a `+`-joined action string (the CLI / persisted form, e.g.
+/// `insertChar+submitOrNewline`) into its list of [`KeyEventAction`]s.
+/// `insertString(value)` is handled specially so the literal value survives.
+fn parse_actions_str(action_str: &str) -> Result<Vec<KeyEventAction>> {
+    let actions: Vec<KeyEventAction> = action_str
+        .split('+')
+        .map(|s| {
+            let s = s.trim();
+            if let Some(stripped) = s.strip_prefix("insertString(") {
+                if !stripped.ends_with(')') {
+                    return Err(anyhow::anyhow!(
+                        "Invalid insertString syntax: '{}'. Expected 'insertString(value)'",
+                        s
+                    ));
+                }
+                let inner = &stripped[..stripped.len() - 1];
+                let inner_trimmed = if (inner.starts_with('"') && inner.ends_with('"'))
+                    || (inner.starts_with('\'') && inner.ends_with('\''))
+                {
+                    if inner.len() >= 2 {
+                        &inner[1..inner.len() - 1]
+                    } else {
+                        inner
+                    }
+                } else {
+                    inner
+                };
+                let unescaped = unescape_string(inner_trimmed);
+                Ok(KeyEventAction::InsertString(unescaped))
+            } else {
+                KeyEventAction::try_from(s).map_err(|_| anyhow::anyhow!("Unknown action: '{}'", s))
+            }
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    if actions.is_empty() {
+        return Err(anyhow::anyhow!("No actions specified"));
+    }
+    Ok(actions)
+}
+
+/// Render a list of actions back into the `+`-joined CLI / persisted form, the
+/// inverse of [`parse_actions_str`].
+fn actions_to_string(actions: &[KeyEventAction]) -> String {
+    actions
+        .iter()
+        .map(|a| a.display_name())
+        .collect::<Vec<_>>()
+        .join("+")
+}
+
+/// Human-readable serialized form of a [`Binding`], e.g.
+/// `{"keys":["ctrl+s"],"context":"always","action":"submitOrNewline"}`.
+/// Keys serialize as strings, the context serializes as its canonical
+/// `+`-joined literal string (see [`ContextExpr`]), and the actions serialize
+/// as a single `+`-joined action string.
+#[derive(Serialize, Deserialize)]
+struct BindingRepr {
+    keys: Vec<KeyEventMatch>,
+    #[serde(default = "default_binding_context")]
+    context: ContextExpr,
+    action: String,
+}
+
+impl Serialize for Binding {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        BindingRepr {
+            keys: self.key_events.clone(),
+            context: self.context.clone(),
+            action: actions_to_string(&self.actions),
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for Binding {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let repr = BindingRepr::deserialize(deserializer)?;
+        let actions = parse_actions_str(&repr.action).map_err(serde::de::Error::custom)?;
+        Ok(Binding {
+            key_events: repr.keys,
+            context: repr.context,
+            actions,
+        })
+    }
 }
 
 impl Binding {
@@ -1324,42 +1633,7 @@ impl Binding {
                 context_and_action
             )
         })?;
-        let action_str = action_str.trim();
-        let actions: Vec<KeyEventAction> = action_str
-            .split('+')
-            .map(|s| {
-                let s = s.trim();
-                if let Some(stripped) = s.strip_prefix("insertString(") {
-                    if !stripped.ends_with(')') {
-                        return Err(anyhow::anyhow!(
-                            "Invalid insertString syntax: '{}'. Expected 'insertString(value)'",
-                            s
-                        ));
-                    }
-                    let inner = &stripped[..stripped.len() - 1];
-                    let inner_trimmed = if (inner.starts_with('"') && inner.ends_with('"'))
-                        || (inner.starts_with('\'') && inner.ends_with('\''))
-                    {
-                        if inner.len() >= 2 {
-                            &inner[1..inner.len() - 1]
-                        } else {
-                            inner
-                        }
-                    } else {
-                        inner
-                    };
-                    let unescaped = unescape_string(inner_trimmed);
-                    Ok(KeyEventAction::InsertString(unescaped))
-                } else {
-                    KeyEventAction::try_from(s)
-                        .map_err(|_| anyhow::anyhow!("Unknown action: '{}'", s))
-                }
-            })
-            .collect::<Result<Vec<_>>>()?;
-
-        if actions.is_empty() {
-            return Err(anyhow::anyhow!("No actions specified"));
-        }
+        let actions = parse_actions_str(action_str.trim())?;
 
         Ok(Self::new(
             &[KeyEventMatch::try_from(key_event)?],
@@ -1671,6 +1945,93 @@ mod expand_variations_tests {
                 KeyEventMatch::Exact(KeyEvent::new(KeyCode::Char('.'), KeyModifiers::META)),
             ]
         );
+    }
+}
+
+#[cfg(test)]
+mod key_string_roundtrip_tests {
+    use super::*;
+    use crossterm::event::{KeyCode, KeyModifiers};
+
+    #[test]
+    fn key_event_match_display_is_inverse_of_parse() {
+        // For every supported key string, parse(display(parse(s))) == parse(s).
+        let cases = [
+            "ctrl+alt+s",
+            "alt+enter",
+            "f1",
+            "esc",
+            "tab",
+            "ctrl+anychar",
+            "anychar",
+            "a",
+            "space",
+            "ctrl+shift+left",
+            "media:playpause",
+            "modifier:leftshift",
+        ];
+        for s in cases {
+            let parsed =
+                KeyEventMatch::try_from(s).unwrap_or_else(|e| panic!("failed to parse '{s}': {e}"));
+            let displayed = parsed.to_key_string();
+            let reparsed = KeyEventMatch::try_from(displayed.as_str())
+                .unwrap_or_else(|e| panic!("failed to reparse '{displayed}': {e}"));
+            assert_eq!(
+                parsed, reparsed,
+                "round-trip failed for '{s}' (displayed as '{displayed}')"
+            );
+        }
+    }
+
+    #[test]
+    fn canonical_display_forms() {
+        // The canonical string is stable and human-readable.
+        let kem = KeyEventMatch::try_from("ctrl+s").unwrap();
+        assert_eq!(kem.to_key_string(), "ctrl+s");
+        let anychar = KeyEventMatch::AnyCharAndMods(KeyModifiers::CONTROL);
+        assert_eq!(anychar.to_key_string(), "ctrl+anychar");
+        let space: KeyEventMatch = KeyCode::Char(' ').into();
+        assert_eq!(space.to_key_string(), "space");
+    }
+
+    #[test]
+    fn key_remap_round_trips_via_json() {
+        let key_remap = KeyRemap::Key {
+            from: KeyCode::Tab,
+            to: KeyCode::Char('z'),
+        };
+        let json = serde_json::to_string(&key_remap).unwrap();
+        assert_eq!(json, r#"{"from":"tab","to":"z"}"#);
+        let back: KeyRemap = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, key_remap);
+
+        let mod_remap = KeyRemap::Modifier {
+            from: KeyModifiers::ALT,
+            to: KeyModifiers::CONTROL,
+        };
+        let json = serde_json::to_string(&mod_remap).unwrap();
+        assert_eq!(json, r#"{"from":"alt","to":"ctrl"}"#);
+        let back: KeyRemap = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, mod_remap);
+    }
+
+    #[test]
+    fn binding_serializes_as_human_readable_strings() {
+        let binding = Binding::try_new_from_strs("ctrl+s", "always=submitOrNewline").unwrap();
+        let json = serde_json::to_string(&binding).unwrap();
+        assert!(json.contains(r#""keys":["ctrl+s"]"#));
+        assert!(json.contains(r#""context":"always""#));
+        assert!(json.contains(r#""action":"submitOrNewline""#));
+        let back: Binding = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, binding);
+    }
+
+    #[test]
+    fn binding_context_defaults_to_always_when_omitted() {
+        let json = r#"{"keys":["ctrl+s"],"action":"submitOrNewline"}"#;
+        let back: Binding = serde_json::from_str(json).unwrap();
+        let expected = Binding::try_new_from_strs("ctrl+s", "always=submitOrNewline").unwrap();
+        assert_eq!(back, expected);
     }
 }
 

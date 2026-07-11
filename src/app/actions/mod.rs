@@ -159,6 +159,26 @@ where
     }
 }
 
+/// Context expressions serialize as their canonical `+`-joined literal string
+/// (the exact form accepted by [`ContextExpr::try_from`]), never as a nested
+/// struct.  This keeps persisted bindings human-readable and shell-agnostic.
+impl<V: ContextVar> serde::Serialize for ContextExpr<V> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.display())
+    }
+}
+
+impl<'de, V> serde::Deserialize<'de> for ContextExpr<V>
+where
+    V: ContextVar + std::str::FromStr,
+    <V as std::str::FromStr>::Err: std::fmt::Debug,
+{
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(deserializer)?;
+        ContextExpr::try_from(s.as_str()).map_err(serde::de::Error::custom)
+    }
+}
+
 impl<V> TryFrom<&str> for ContextExpr<V>
 where
     V: ContextVar + std::str::FromStr,

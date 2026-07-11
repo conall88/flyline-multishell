@@ -1,6 +1,7 @@
 #!/bin/sh
 # Flyline installer
 # Usage: curl -sSfL https://github.com/HalFrgrd/flyline/releases/latest/download/install.sh | sh
+#        sh install.sh --uninstall
 
 set -eu
 
@@ -21,6 +22,10 @@ else
     INSTALL_DIR="${HOME}/.local/lib"
 fi
 BASHRC="${HOME}/.bashrc"
+ZSHRC="${HOME}/.zshrc"
+FLYLINE_ZSHRC_START="# >>> flyline start >>>"
+FLYLINE_ZSHRC_END="# <<< flyline end <<<"
+STANDALONE_BIN="flyline-standalone"
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -173,6 +178,183 @@ verify_sha256() {
 }
 
 # ---------------------------------------------------------------------------
+# Zsh integration
+# ---------------------------------------------------------------------------
+
+has_zsh() {
+    command -v zsh >/dev/null 2>&1
+}
+
+zshrc_has_flyline_block() {
+    [ -f "$ZSHRC" ] && grep -qF "$FLYLINE_ZSHRC_START" "$ZSHRC"
+}
+
+backup_zshrc_if_needed() {
+    if [ ! -f "$ZSHRC" ]; then
+        return
+    fi
+    if zshrc_has_flyline_block; then
+        return
+    fi
+    ts="$(date +%Y%m%d%H%M%S)"
+    cp "$ZSHRC" "${ZSHRC}.flyline.bak.${ts}"
+    say "Backed up ${ZSHRC} to ${ZSHRC}.flyline.bak.${ts}"
+}
+
+install_flyline_zsh_script() {
+    dest="${INSTALL_DIR}/scripts/flyline.zsh"
+    mkdir -p "${INSTALL_DIR}/scripts"
+
+    if [ -f "./scripts/flyline.zsh" ]; then
+        cp "./scripts/flyline.zsh" "$dest"
+        return
+    fi
+    if [ -n "${0:-}" ] && [ "$0" != "sh" ]; then
+        script_dir="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+        if [ -f "${script_dir}/scripts/flyline.zsh" ]; then
+            cp "${script_dir}/scripts/flyline.zsh" "$dest"
+            return
+        fi
+    fi
+
+    if [ -z "${VERSION:-}" ]; then
+        err "Cannot locate scripts/flyline.zsh (run install from a checkout or set FLYLINE_INSTALL_VERSION)."
+    fi
+    say "Downloading scripts/flyline.zsh..."
+    download "https://raw.githubusercontent.com/${REPO}/${VERSION}/scripts/flyline.zsh" "$dest"
+}
+
+install_zsh_integration() {
+    if ! has_zsh; then
+        return
+    fi
+
+    install_flyline_zsh_script
+
+    standalone_path="${INSTALL_DIR}/${STANDALONE_BIN}"
+    if [ -f "$standalone_path" ]; then
+        chmod +x "$standalone_path"
+        say "Installed zsh editor: ${standalone_path}"
+    else
+        warn "zsh detected but ${standalone_path} is not installed yet."
+        warn "Zsh integration will stay disabled until the standalone binary is available."
+    fi
+
+    ensure_zshrc_block
+}
+
+# Append the guarded flyline block to ~/.zshrc (idempotent; backs up first).
+ensure_zshrc_block() {
+    if zshrc_has_flyline_block; then
+        say "Flyline zsh block already present in ${ZSHRC}; skipping."
+        return
+    fi
+
+    backup_zshrc_if_needed
+    touch "$ZSHRC"
+    # shellcheck disable=SC2016
+    cat >> "$ZSHRC" <<EOF
+
+${FLYLINE_ZSHRC_START}
+export FLYLINE_BIN="${INSTALL_DIR}/${STANDALONE_BIN}"
+[[ -r "${INSTALL_DIR}/scripts/flyline.zsh" ]] && . "${INSTALL_DIR}/scripts/flyline.zsh"
+${FLYLINE_ZSHRC_END}
+EOF
+    say "Added flyline zsh block to ${ZSHRC}"
+}
+
+remove_zshrc_flyline_block() {
+    if [ ! -f "$ZSHRC" ]; then
+        return
+    fi
+    if ! grep -qF "$FLYLINE_ZSHRC_START" "$ZSHRC"; then
+        return
+    fi
+    tmp="$(mktemp "${TMPDIR:-/tmp}/flyline.zshrc.XXXXXX")"
+    awk -v start="$FLYLINE_ZSHRC_START" -v end="$FLYLINE_ZSHRC_END" '
+        $0 == start { skip = 1; next }
+        $0 == end   { skip = 0; next }
+        !skip { print }
+    ' "$ZSHRC" > "$tmp"
+    mv "$tmp" "$ZSHRC"
+    say "Removed flyline block from ${ZSHRC}"
+}
+
+# Install from locally-built artifacts (cargo build) instead of a release
+# download. Symlinks the built binary/lib and the checkout's widget script into
+# INSTALL_DIR, then wires up ~/.zshrc — so rebuilds are picked up automatically.
+# Usage: sh install.sh --local [DIST_DIR]   (DIST_DIR defaults to target/release)
+local_main() {
+    # Resolve the checkout dir (where scripts/ and target/ live).
+    if [ -n "${0:-}" ] && [ "$0" != "sh" ]; then
+        REPO_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+    else
+        REPO_DIR="$(pwd)"
+    fi
+
+    if [ -n "${1:-}" ]; then
+        DIST_DIR="$(expand_path "$1")"
+    elif [ -n "${FLYLINE_LOCAL_DIST:-}" ]; then
+        DIST_DIR="$(expand_path "$FLYLINE_LOCAL_DIST")"
+    elif [ -x "${REPO_DIR}/target/release/${STANDALONE_BIN}" ]; then
+        DIST_DIR="${REPO_DIR}/target/release"
+    else
+        DIST_DIR="${REPO_DIR}/target/debug"
+    fi
+
+    standalone_src="${DIST_DIR}/${STANDALONE_BIN}"
+    if [ ! -x "$standalone_src" ]; then
+        err "No ${STANDALONE_BIN} in ${DIST_DIR}. Build it first:
+    cargo build --release --features standalone"
+    fi
+
+    if [ ! -f "${REPO_DIR}/scripts/flyline.zsh" ]; then
+        err "Cannot find ${REPO_DIR}/scripts/flyline.zsh (run --local from the flyline checkout)."
+    fi
+
+    mkdir -p "$INSTALL_DIR" "${INSTALL_DIR}/scripts"
+
+    ln -sf "$standalone_src" "${INSTALL_DIR}/${STANDALONE_BIN}"
+    say "Linked ${INSTALL_DIR}/${STANDALONE_BIN} -> ${standalone_src}"
+
+    # Best-effort: link the Bash loadable too, if it was built.
+    for lib in libflyline.so libflyline.dylib; do
+        if [ -f "${DIST_DIR}/${lib}" ]; then
+            ln -sf "${DIST_DIR}/${lib}" "${INSTALL_DIR}/${lib}"
+            say "Linked ${INSTALL_DIR}/${lib} -> ${DIST_DIR}/${lib}"
+        fi
+    done
+
+    ln -sf "${REPO_DIR}/scripts/flyline.zsh" "${INSTALL_DIR}/scripts/flyline.zsh"
+    say "Linked ${INSTALL_DIR}/scripts/flyline.zsh -> ${REPO_DIR}/scripts/flyline.zsh"
+
+    if ! has_zsh; then
+        warn "zsh not found on PATH; installed files but skipped ~/.zshrc integration."
+        return
+    fi
+
+    ensure_zshrc_block
+
+    say ""
+    say "Local install complete."
+    say "    Activate now:        exec zsh"
+    say "    Run the tutorial:    flyline run-tutorial"
+    say "    Disable in session:  flyline_disable"
+    say "    Uninstall:           sh install.sh --uninstall"
+    say "    Symlinks mean rebuilds are picked up automatically (no re-install)."
+}
+
+uninstall_main() {
+    say "Uninstalling flyline zsh integration..."
+    remove_zshrc_flyline_block
+    rm -f "${INSTALL_DIR}/${STANDALONE_BIN}" "${INSTALL_DIR}/scripts/flyline.zsh"
+    rmdir "${INSTALL_DIR}/scripts" 2>/dev/null || true
+    say "Removed zsh integration files from ${INSTALL_DIR}"
+    say "libflyline was left in place for Bash users; remove ${INSTALL_DIR}/libflyline.so (or .dylib) manually if unused."
+    say "Restart zsh or run: unfunction flyline flyline_enable flyline_disable flyline_uninstall _flyline_edit 2>/dev/null"
+}
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -293,6 +475,12 @@ main() {
     LIB_PATH="${INSTALL_DIR}/${LIB_NAME}"
     say "Installed: ${LIB_PATH}"
 
+    if [ -f "${INSTALL_DIR}/${STANDALONE_BIN}" ]; then
+        chmod +x "${INSTALL_DIR}/${STANDALONE_BIN}"
+    fi
+
+    install_zsh_integration
+
     # Update or add 'enable -f ... flyline' in ~/.bashrc.
     if [ -z "${FLYLINE_VERSION:-}" ]; then
         ENABLE_CMD="enable -f ${LIB_PATH} flyline"
@@ -341,6 +529,9 @@ main() {
         else
             say "        enable -d flyline && enable -f ${LIB_PATH} flyline"
         fi
+        if has_zsh && [ -f "${INSTALL_DIR}/${STANDALONE_BIN}" ]; then
+            say '    For zsh, open a new terminal (or run: exec zsh).'
+        fi
         say '    Or open a new terminal and run the tutorial:'
         say "        flyline run-tutorial"
     fi
@@ -353,4 +544,19 @@ main() {
     fi
 }
 
-main "$@"
+case "${1:-}" in
+    --uninstall|-u)
+        if [ -n "${FLYLINE_INSTALL_DIR:-}" ]; then
+            INSTALL_DIR="$(expand_path "$FLYLINE_INSTALL_DIR")"
+        elif [ -n "${FLYLINE_LOAD_DIR:-}" ]; then
+            INSTALL_DIR="$(expand_path "$FLYLINE_LOAD_DIR")"
+        fi
+        uninstall_main
+        ;;
+    --local|-l)
+        local_main "${2:-}"
+        ;;
+    *)
+        main "$@"
+        ;;
+esac

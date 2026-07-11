@@ -89,16 +89,19 @@ static TEST_LOG_INIT: Once = Once::new();
 
 pub fn init() -> Result<()> {
     let logger = LOGGER.get_or_init(MemoryLogger::new);
-    match log::set_logger(logger) {
-        Ok(()) => {
-            log::set_max_level(LevelFilter::Trace);
-            Ok(())
-        }
-        Err(_) => {
-            log::set_max_level(LevelFilter::Trace);
-            Ok(())
-        }
+    let _ = log::set_logger(logger);
+    log::set_max_level(LevelFilter::Trace);
+
+    // Opt-in file sink. Per-prompt hosts (e.g. the standalone zsh editor) run a
+    // fresh process each prompt, so their in-memory logs vanish; pointing
+    // FLYLINE_LOG_FILE at a path appends every process's logs there for
+    // debugging (entries are pid-tagged). Harmless when unset.
+    if let Ok(path) = std::env::var("FLYLINE_LOG_FILE")
+        && !path.is_empty()
+    {
+        let _ = stream_logs(&path);
     }
+    Ok(())
 }
 
 #[cfg(test)]
