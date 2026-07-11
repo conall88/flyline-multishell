@@ -150,6 +150,17 @@ pub enum SuggestionType {
     Misc,
 }
 
+/// What flycomp should do after the user approves a completion request.
+///
+/// Installing a script is the long-standing fallback for commands without a
+/// useful native completer. Suggesting options consumes flycomp's JSON model
+/// directly and must never replace a registered native completer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum FlycompRequest {
+    InstallCompletionScript,
+    SuggestOptions,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ProcessedSuggestion {
     pub s: String,
@@ -600,7 +611,7 @@ mod description_tests {
             comp_type: crate::tab_completion_context::CompType::FirstWord,
             nosort: false,
             compspec_was_useful: Some(true),
-            should_run_flycomp: false,
+            flycomp_request: None,
         };
         let mut active = ActiveSuggestions::new(
             builder,
@@ -671,7 +682,7 @@ mod description_tests {
             comp_type: crate::tab_completion_context::CompType::FirstWord,
             nosort: false,
             compspec_was_useful: Some(true),
-            should_run_flycomp: false,
+            flycomp_request: None,
         };
         let mut active = ActiveSuggestions::new(
             builder,
@@ -711,7 +722,7 @@ mod description_tests {
                 comp_type: crate::tab_completion_context::CompType::FirstWord,
                 nosort: false,
                 compspec_was_useful: Some(true),
-                should_run_flycomp: false,
+                flycomp_request: None,
             },
             SubString::new("c", "c").unwrap(),
             std::time::Duration::from_millis(0),
@@ -745,7 +756,7 @@ mod description_tests {
             comp_type: crate::tab_completion_context::CompType::FirstWord,
             nosort: false,
             compspec_was_useful: Some(true),
-            should_run_flycomp: false,
+            flycomp_request: None,
         };
 
         // mtime descending: c(200), then {a, b} (100), then d(0).
@@ -787,7 +798,7 @@ mod description_tests {
             comp_type: crate::tab_completion_context::CompType::FirstWord,
             nosort: false,
             compspec_was_useful: Some(true),
-            should_run_flycomp: false,
+            flycomp_request: None,
         };
 
         let active_alpha = ActiveSuggestions::new(
@@ -826,7 +837,7 @@ mod description_tests {
             comp_type: crate::tab_completion_context::CompType::FirstWord,
             nosort: true,
             compspec_was_useful: Some(true),
-            should_run_flycomp: false,
+            flycomp_request: None,
         };
 
         let mut active = ActiveSuggestions::new(
@@ -886,7 +897,7 @@ mod description_tests {
             comp_type: crate::tab_completion_context::CompType::FirstWord,
             nosort: false,
             compspec_was_useful: Some(true),
-            should_run_flycomp: false,
+            flycomp_request: None,
         };
         let active_boundary = ActiveSuggestions::new(
             builder_boundary,
@@ -912,7 +923,7 @@ mod description_tests {
             comp_type: crate::tab_completion_context::CompType::FirstWord,
             nosort: false,
             compspec_was_useful: Some(true),
-            should_run_flycomp: false,
+            flycomp_request: None,
         };
         let active_large = ActiveSuggestions::new(
             builder_large,
@@ -992,7 +1003,7 @@ mod description_tests {
             comp_type: crate::tab_completion_context::CompType::FirstWord,
             nosort: false,
             compspec_was_useful: Some(true),
-            should_run_flycomp: false,
+            flycomp_request: None,
         };
 
         // Case 1: pattern "oo" - should only match RegularFile and Misc, but NOT Folder (as "oo" is not a prefix of "foobar").
@@ -1311,7 +1322,7 @@ pub struct ActiveSuggestionsBuilder {
     pub comp_type: tab_completion_context::CompType,
     pub nosort: bool,
     pub compspec_was_useful: Option<bool>,
-    pub should_run_flycomp: bool,
+    pub flycomp_request: Option<FlycompRequest>,
 }
 
 impl ActiveSuggestionsBuilder {
@@ -1327,7 +1338,7 @@ impl ActiveSuggestionsBuilder {
             comp_type: tab_completion_context::CompType::default(),
             nosort: false,
             compspec_was_useful: None,
-            should_run_flycomp: false,
+            flycomp_request: None,
         }
     }
 
@@ -1360,8 +1371,8 @@ impl ActiveSuggestionsBuilder {
     }
 
     #[allow(dead_code)]
-    pub fn with_should_run_flycomp(mut self, should_run_flycomp: bool) -> Self {
-        self.should_run_flycomp = should_run_flycomp;
+    pub fn with_flycomp_request(mut self, flycomp_request: FlycompRequest) -> Self {
+        self.flycomp_request = Some(flycomp_request);
         self
     }
 

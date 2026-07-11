@@ -266,6 +266,17 @@ pub struct Settings {
     pub auto_suggest: bool,
     /// Whether to use flycomp to synthesize completions.
     pub use_flycomp: bool,
+    /// Whether to offer flycomp option synthesis when a native completer *is*
+    /// registered but returns nothing for an option-shaped word (`-`/`--`).
+    ///
+    /// Many tools ship a completer that lags their `--help` (e.g. BSD `grep`,
+    /// whose zsh/bash completers target GNU options), so `grep --<Tab>` yields
+    /// nothing. When `true`, flyline treats that empty result as a cue to offer
+    /// synthesizing options from `--help`, instead of silently falling back to
+    /// filename completion. It does NOT change behaviour for non-option words
+    /// (e.g. `kubectl get <Tab>` stays silent, since an empty result there is
+    /// contextual, not a missing-options signal). Requires `use_flycomp`.
+    pub flycomp_synthesize_options: bool,
     /// Optional path to the directory where flycomp output is saved.
     /// When `None`, defaults to `~/.local/share/bash-completion/completions/`.
     pub flycomp_output: Option<String>,
@@ -439,6 +450,7 @@ impl Default for Settings {
             show_animations: true,
             auto_suggest: true,
             use_flycomp: true,
+            flycomp_synthesize_options: true,
             flycomp_output: None,
             suggestion_sort_order: SuggestionSortOrder::default(),
             fuzzy_mode: FuzzyMode::default(),

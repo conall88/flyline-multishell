@@ -925,6 +925,7 @@ impl<'a> App<'a> {
                 selection,
                 sandbox,
                 dump_path,
+                request,
                 ..
             } if self.mode.is_running() => {
                 content.newline();
@@ -969,7 +970,15 @@ impl<'a> App<'a> {
 
                 content.write_tagged_span(&TaggedSpan::new(
                     Span::styled(
-                        format!("No completion script found for '{}'. Run ", command_word),
+                        match request {
+                            FlycompRequest::InstallCompletionScript => {
+                                format!("No completion script found for '{}'. Run ", command_word)
+                            }
+                            FlycompRequest::SuggestOptions => format!(
+                                "The native completer returned no matching options for '{}'. Run ",
+                                command_word
+                            ),
+                        },
                         self.settings.colour_palette.normal_text(),
                     ),
                     Tag::Normal,
@@ -996,26 +1005,31 @@ impl<'a> App<'a> {
 
                 content.write_tagged_span(&TaggedSpan::new(
                     Span::styled(
-                        ") to synthesize one?",
+                        match request {
+                            FlycompRequest::InstallCompletionScript => ") to synthesize one?",
+                            FlycompRequest::SuggestOptions => ") to synthesize options?",
+                        },
                         self.settings.colour_palette.normal_text(),
                     ),
                     Tag::Normal,
                 ));
-                content.newline();
-                content.write_tagged_span(&TaggedSpan::new(
-                    Span::styled(
-                        "  Would create: ",
-                        self.settings.colour_palette.normal_text(),
-                    ),
-                    Tag::Normal,
-                ));
-                content.write_tagged_span(&TaggedSpan::new(
-                    Span::styled(
-                        dump_path.to_string(),
-                        self.settings.colour_palette.key_sequence_style(),
-                    ),
-                    Tag::Normal,
-                ));
+                if let Some(dump_path) = dump_path {
+                    content.newline();
+                    content.write_tagged_span(&TaggedSpan::new(
+                        Span::styled(
+                            "  Would create: ",
+                            self.settings.colour_palette.normal_text(),
+                        ),
+                        Tag::Normal,
+                    ));
+                    content.write_tagged_span(&TaggedSpan::new(
+                        Span::styled(
+                            dump_path.to_string(),
+                            self.settings.colour_palette.key_sequence_style(),
+                        ),
+                        Tag::Normal,
+                    ));
+                }
                 content.newline();
                 content.write_tagged_span(&TaggedSpan::new(
                     Span::styled(
@@ -1093,7 +1107,7 @@ impl<'a> App<'a> {
 
                 if flycomp_hover {
                     let popup_style = self.settings.colour_palette.normal_text();
-                    let flycomp_msg = "flycomp parses CLI `--help` outputs and man pages to dynamically synthesize shell completion scripts.\nGitHub: https://github.com/HalFrgrd/flycomp";
+                    let flycomp_msg = "flycomp parses CLI `--help` outputs and man pages to dynamically synthesize completion models and shell scripts.\nGitHub: https://github.com/HalFrgrd/flycomp";
                     content.draw_popup(
                         flycomp_msg,
                         flycomp_anchor_pos.row + 1,
@@ -1107,13 +1121,20 @@ impl<'a> App<'a> {
             ContentMode::TabCompletionRunningFlycomp {
                 command_word,
                 start_time,
+                request,
                 ..
             } if self.mode.is_running() => {
                 content.newline();
-                let text = format!(
-                    "Running flycomp to synthesize completions for '{}'...",
-                    command_word
-                );
+                let text = match request {
+                    FlycompRequest::InstallCompletionScript => format!(
+                        "Running flycomp to synthesize completions for '{}'...",
+                        command_word
+                    ),
+                    FlycompRequest::SuggestOptions => format!(
+                        "Running flycomp to synthesize options for '{}'...",
+                        command_word
+                    ),
+                };
                 let line = gaussian_wave_animated(&text, now, *start_time);
                 content.write_tagged_line(&TaggedLine::from_line(line, Tag::Normal), false);
             }
@@ -2351,7 +2372,7 @@ mod tests {
             comp_type: crate::tab_completion_context::CompType::FirstWord,
             nosort: false,
             compspec_was_useful: Some(true),
-            should_run_flycomp: false,
+            flycomp_request: None,
         };
 
         let mut active = ActiveSuggestions::new(
@@ -2433,7 +2454,7 @@ mod tests {
             comp_type: crate::tab_completion_context::CompType::FirstWord,
             nosort: false,
             compspec_was_useful: Some(true),
-            should_run_flycomp: false,
+            flycomp_request: None,
         };
 
         let mut active = ActiveSuggestions::new(
@@ -2502,7 +2523,7 @@ mod tests {
             comp_type: crate::tab_completion_context::CompType::FirstWord,
             nosort: false,
             compspec_was_useful: Some(true),
-            should_run_flycomp: false,
+            flycomp_request: None,
         };
 
         let mut active = ActiveSuggestions::new(
@@ -2590,7 +2611,7 @@ mod tests {
             comp_type: crate::tab_completion_context::CompType::FirstWord,
             nosort: false,
             compspec_was_useful: Some(true),
-            should_run_flycomp: false,
+            flycomp_request: None,
         };
 
         let mut active = ActiveSuggestions::new(

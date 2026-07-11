@@ -516,6 +516,10 @@ enum Commands {
         /// Enable or disable flycomp for synthesizing shell completions when no useful compspec is found.
         #[arg(long = "use-flycomp", default_missing_value = "true", num_args = 0..=1)]
         use_flycomp: Option<bool>,
+        /// Offer flycomp option synthesis when a native completer is registered
+        /// but returns nothing for an option-shaped word (e.g. `grep --`).
+        #[arg(long = "flycomp-synthesize-options", default_missing_value = "true", num_args = 0..=1)]
+        flycomp_synthesize_options: Option<bool>,
         /// How to sort suggestions when fuzzy scores are tied (mtime, alphabetical).
         #[arg(long = "sort-order", value_name = "ORDER")]
         sort_order: Option<settings::SuggestionSortOrder>,
@@ -1256,6 +1260,7 @@ pub fn run_flyline_command(cfg: &mut settings::Settings, args: &[&str]) -> c_int
                     subcommand,
                     auto_suggest,
                     use_flycomp,
+                    flycomp_synthesize_options,
                     sort_order,
                     num_suggestion_rows,
                     flycomp_output,
@@ -1280,6 +1285,10 @@ pub fn run_flyline_command(cfg: &mut settings::Settings, args: &[&str]) -> c_int
                     if let Some(enabled) = use_flycomp {
                         log::info!("Use flycomp set to {}", enabled);
                         cfg.use_flycomp = enabled;
+                    }
+                    if let Some(enabled) = flycomp_synthesize_options {
+                        log::info!("Flycomp synthesize options set to {}", enabled);
+                        cfg.flycomp_synthesize_options = enabled;
                     }
                     if let Some(order) = sort_order {
                         log::info!("Suggestion sort order set to {:?}", order);
@@ -1563,6 +1572,14 @@ mod tests {
         let code = run_flyline_command(&mut cfg, &["suggestions", "--num-suggestion-rows", "7"]);
         assert_eq!(code, OK);
         assert_eq!(cfg.num_suggestion_rows, 7);
+
+        assert!(cfg.flycomp_synthesize_options);
+        let code = run_flyline_command(
+            &mut cfg,
+            &["suggestions", "--flycomp-synthesize-options", "false"],
+        );
+        assert_eq!(code, OK);
+        assert!(!cfg.flycomp_synthesize_options);
     }
 
     #[test]

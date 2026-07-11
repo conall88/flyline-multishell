@@ -22,6 +22,7 @@ mod content_builder;
 mod content_utils;
 mod cursor;
 mod dparser;
+mod flycomp_options;
 mod globbing;
 mod history;
 pub mod hostnames;

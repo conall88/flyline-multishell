@@ -29,7 +29,9 @@ pub enum RightClickCopyTarget {
     Cwd(String),
 }
 
-use crate::active_suggestions::{ActiveSuggestions, ActiveSuggestionsBuilder, COLUMN_PADDING};
+use crate::active_suggestions::{
+    ActiveSuggestions, ActiveSuggestionsBuilder, COLUMN_PADDING, FlycompRequest,
+};
 use crate::agent_mode::{AiOutputSelection, parse_ai_output};
 use crate::app::actions::KeyEventAction;
 use crate::app::formatted_buffer::{FormattedBuffer, format_agent_buffer, format_buffer};
@@ -342,14 +344,22 @@ pub(crate) enum ContentMode {
     PromptDirSelect(usize),
     TabCompletionAskForFlycomp {
         command_word: String,
+        command_identity: String,
         word_under_cursor: String,
+        context_before_word: String,
+        buffer_snapshot: String,
+        request: FlycompRequest,
         selection: FlycompPromptSelection,
         sandbox: Option<String>,
-        dump_path: String,
+        dump_path: Option<String>,
     },
     TabCompletionRunningFlycomp {
         command_word: String,
-        _word_under_cursor: String,
+        command_identity: String,
+        word_under_cursor: String,
+        context_before_word: String,
+        buffer_snapshot: String,
+        request: FlycompRequest,
         start_time: std::time::Instant,
         thread_handle: crate::threads::SharedJoinHandle<anyhow::Result<String>>,
     },
@@ -1156,61 +1166,133 @@ impl<'a> App<'a> {
             let mode = std::mem::replace(&mut self.content_mode, ContentMode::Normal);
             if let ContentMode::TabCompletionRunningFlycomp {
                 command_word,
+                command_identity,
+                word_under_cursor,
+                context_before_word,
+                buffer_snapshot,
+                request,
+                start_time,
                 thread_handle,
-                ..
             } = mode
             {
                 let join_res = thread_handle.join_value();
 
                 if let Some(res) = join_res {
                     match res {
-                        Ok(Ok(script)) => {
+                        Ok(Ok(output)) => {
                             log::info!("flycomp succeeded for command '{}'", command_word);
-                            let output_dir = self.settings.flycomp_output.as_deref();
-                            match crate::shell::backend().resolve_and_write_completion_script(
-                                &command_word,
-                                &script,
-                                output_dir,
-                            ) {
-                                Ok(write_path) => {
-                                    log::info!(
-                                        "Wrote synthesized completion script to '{}'",
-                                        write_path.display()
-                                    );
-                                }
-                                Err(e) => {
-                                    log::error!("Failed to write completion script: {}", e);
-                                }
-                            }
+                            match request {
+                                FlycompRequest::InstallCompletionScript => {
+                                    let output_dir = self.settings.flycomp_output.as_deref();
+                                    match crate::shell::backend()
+                                        .resolve_and_write_completion_script(
+                                            &command_word,
+                                            &output,
+                                            output_dir,
+                                        ) {
+                                        Ok(write_path) => {
+                                            log::info!(
+                                                "Wrote synthesized completion script to '{}'",
+                                                write_path.display()
+                                            );
+                                        }
+                                        Err(e) => {
+                                            log::error!("Failed to write completion script: {}", e);
+                                        }
+                                    }
 
-                            match crate::shell::backend().activate_completion_script(
-                                &command_word,
-                                &script,
-                                output_dir,
-                            ) {
-                                Ok(_) => {
-                                    log::info!(
-                                        "Successfully activated synthesized completion script for '{}'",
-                                        command_word
-                                    );
-                                    self.start_tab_complete(false, None);
+                                    match crate::shell::backend().activate_completion_script(
+                                        &command_word,
+                                        &output,
+                                        output_dir,
+                                    ) {
+                                        Ok(_) => {
+                                            log::info!(
+                                                "Successfully activated synthesized completion script for '{}'",
+                                                command_word
+                                            );
+                                            self.start_tab_complete(false, None);
+                                        }
+                                        Err(e) => {
+                                            log::error!(
+                                                "Failed to activate synthesized completion script: {:?}",
+                                                e
+                                            );
+                                            let error_message = format!(
+                                                "Failed to load script:\n  - {}",
+                                                e.chain()
+                                                    .map(|c| c.to_string())
+                                                    .collect::<Vec<_>>()
+                                                    .join("\n  - ")
+                                            );
+                                            self.content_mode =
+                                                ContentMode::TabCompletionFlycompResult {
+                                                    command_word,
+                                                    error_message,
+                                                };
+                                        }
+                                    }
                                 }
-                                Err(e) => {
-                                    log::error!(
-                                        "Failed to activate synthesized completion script: {:?}",
-                                        e
-                                    );
-                                    let error_message = format!(
-                                        "Failed to load script:\n  - {}",
-                                        e.chain()
-                                            .map(|c| c.to_string())
-                                            .collect::<Vec<_>>()
-                                            .join("\n  - ")
-                                    );
-                                    self.content_mode = ContentMode::TabCompletionFlycompResult {
-                                        command_word,
-                                        error_message,
-                                    };
+                                FlycompRequest::SuggestOptions => {
+                                    if self.buffer.buffer() != buffer_snapshot {
+                                        log::debug!(
+                                            "Discarding stale flycomp options for '{}'",
+                                            command_word
+                                        );
+                                        self.content_mode = ContentMode::Normal;
+                                        return true;
+                                    }
+                                    match crate::flycomp_options::parse_flycomp_json(&output) {
+                                        Ok(model) => {
+                                            if let Err(error) =
+                                                crate::flycomp_options::store_cached_model(
+                                                    &command_identity,
+                                                    &model,
+                                                )
+                                            {
+                                                log::warn!(
+                                                    "Could not cache flycomp options for '{}': {}",
+                                                    command_word,
+                                                    error
+                                                );
+                                            }
+                                            let builder =
+                                                crate::flycomp_options::suggestions_from_model(
+                                                    &model,
+                                                    &context_before_word,
+                                                    &word_under_cursor,
+                                                )
+                                                .with_comp_type(
+                                                    crate::tab_completion_context::CompType::CommandComp {
+                                                        command_word: command_word.clone(),
+                                                    },
+                                                );
+                                            let current_wuc =
+                                                self.completion_context().word_under_cursor.clone();
+                                            self.finish_tab_complete(
+                                                builder,
+                                                current_wuc,
+                                                start_time.elapsed(),
+                                                false,
+                                            );
+                                        }
+                                        Err(error) => {
+                                            log::warn!(
+                                                "Could not parse flycomp options for '{}': {:#}",
+                                                command_word,
+                                                error
+                                            );
+                                            self.content_mode =
+                                                ContentMode::TabCompletionFlycompResult {
+                                                    command_word,
+                                                    error_message: error
+                                                        .chain()
+                                                        .map(|cause| cause.to_string())
+                                                        .collect::<Vec<_>>()
+                                                        .join("\n  - "),
+                                                };
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -1244,36 +1326,28 @@ impl<'a> App<'a> {
     pub(crate) fn run_flycomp(
         &mut self,
         command_word: String,
+        command_identity: String,
         word_under_cursor: String,
+        context_before_word: String,
+        buffer_snapshot: String,
+        request: FlycompRequest,
         use_sandbox: bool,
     ) {
-        let poss_alias = crate::shell::backend().find_alias(&command_word);
-        let alias_def = poss_alias
-            .as_deref()
-            .filter(|alias| !alias.is_empty())
-            .unwrap_or(&command_word);
-        let alias_expanded_command_word = alias_def
-            .split_whitespace()
-            .next()
-            .unwrap_or(alias_def)
-            .to_string();
-
-        let mut cmd_word = alias_expanded_command_word;
-        if cmd_word.starts_with('~') || cmd_word.contains('/') {
-            let expanded = crate::shell::backend().expand_path(&cmd_word);
-            if !expanded.is_empty() {
-                cmd_word = expanded;
-            }
-        }
         let start_time = std::time::Instant::now();
-        let output_format = crate::shell::backend().flycomp_output_format();
+        let output_format = match request {
+            FlycompRequest::InstallCompletionScript => {
+                crate::shell::backend().flycomp_output_format()
+            }
+            FlycompRequest::SuggestOptions => flycomp::OutputFormat::Json,
+        };
+        let synthesis_command = command_identity.clone();
         let shared_handle =
             crate::threads::spawn_thread(crate::threads::ThreadTag::Flycomp, move || {
                 unsafe {
                     libc::signal(libc::SIGCHLD, libc::SIG_DFL);
                 }
                 flycomp::generate_completion_output(
-                    &cmd_word,
+                    &synthesis_command,
                     output_format,
                     flycomp::SynthesisStrategy::ManPageOrRunHelp,
                     use_sandbox, // sandbox
@@ -1283,7 +1357,11 @@ impl<'a> App<'a> {
             });
         self.content_mode = ContentMode::TabCompletionRunningFlycomp {
             command_word,
-            _word_under_cursor: word_under_cursor,
+            command_identity,
+            word_under_cursor,
+            context_before_word,
+            buffer_snapshot,
+            request,
             start_time,
             thread_handle: shared_handle,
         };

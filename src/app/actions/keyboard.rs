@@ -319,7 +319,11 @@ impl KeyEventAction {
                 let mode = std::mem::replace(&mut app.content_mode, ContentMode::Normal);
                 if let ContentMode::TabCompletionAskForFlycomp {
                     command_word,
+                    command_identity,
                     word_under_cursor,
+                    context_before_word,
+                    buffer_snapshot,
+                    request,
                     selection,
                     sandbox,
                     ..
@@ -327,7 +331,15 @@ impl KeyEventAction {
                 {
                     match selection {
                         FlycompPromptSelection::Yes => {
-                            app.run_flycomp(command_word, word_under_cursor, sandbox.is_some());
+                            app.run_flycomp(
+                                command_word,
+                                command_identity,
+                                word_under_cursor,
+                                context_before_word,
+                                buffer_snapshot,
+                                request,
+                                sandbox.is_some(),
+                            );
                         }
                         FlycompPromptSelection::No => {}
                         FlycompPromptSelection::DontAsk => {

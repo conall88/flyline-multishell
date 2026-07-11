@@ -85,5 +85,10 @@ flyline_uninstall() {
   unset FLYLINE_BIN
 }
 
-flyline_enable
+# Inside flyline's own headless completion daemon (spawn_comp_daemon sets this),
+# do NOT install the interactive editor hook. The daemon runs `zsh -i` to inherit
+# the user's completion setup, but launching another interactive editor from its
+# line-init hook is unnecessary and could interact with the user's controlling
+# tty. The completion machinery the daemon needs is unaffected.
+[[ -n ${FLYLINE_ZSH_DAEMON:-} ]] || flyline_enable
 # <<< flyline end <<<

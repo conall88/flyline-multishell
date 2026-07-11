@@ -923,6 +923,21 @@ fn read_until_marker_timeout(
 
 // ponytail: libc openpty — plain pipes cannot drive ZLE `complete-word`; no extra crate.
 fn spawn_comp_daemon(script_path: &Path) -> anyhow::Result<CompDaemon> {
+    spawn_comp_daemon_with_env(script_path, &[])
+}
+
+/// Boot the headless completion daemon. `extra_env` is layered onto the child
+/// `zsh` (used by tests to point at a scratch rc); production callers pass `&[]`.
+///
+/// `FLYLINE_ZSH_DAEMON=1` is always set here — the single choke point every
+/// daemon (in-process and broker) flows through. `scripts/flyline.zsh` reads it
+/// to skip installing its interactive `line-init` editor hook, which the
+/// completion-only daemon never needs and which could otherwise re-enter the
+/// editor against the user's controlling tty.
+fn spawn_comp_daemon_with_env(
+    script_path: &Path,
+    extra_env: &[(&str, &str)],
+) -> anyhow::Result<CompDaemon> {
     use std::os::unix::io::FromRawFd;
 
     let mut master: libc::c_int = 0;
@@ -950,13 +965,16 @@ fn spawn_comp_daemon(script_path: &Path) -> anyhow::Result<CompDaemon> {
 
     // Load the user's rc by default (for their fpath completions); NO_RCS uses -f.
     let args: &[&str] = if no_rcs() { &["-f", "-i"] } else { &["-i"] };
-    let child = Command::new("zsh")
-        .args(args)
+    let mut cmd = Command::new("zsh");
+    cmd.args(args)
+        .env("FLYLINE_ZSH_DAEMON", "1")
         .stdin(Stdio::from(slave_in))
         .stdout(Stdio::from(slave_file))
-        .stderr(Stdio::null())
-        .spawn()
-        .context("spawn zsh completion daemon")?;
+        .stderr(Stdio::null());
+    for (key, value) in extra_env {
+        cmd.env(key, value);
+    }
+    let child = cmd.spawn().context("spawn zsh completion daemon")?;
 
     // Guard the child now so any early return (e.g. boot timeout) kills it.
     let daemon = CompDaemon {
@@ -1479,6 +1497,83 @@ mod tests {
                 .any(|s| s.starts_with("add") || s.starts_with("checkout")),
             "expected git subcommand in {:?}",
             result.completions.iter().take(5).collect::<Vec<_>>(),
+        );
+    }
+
+    /// When the daemon loads a user rc that sources
+    /// `scripts/flyline.zsh`, the `FLYLINE_ZSH_DAEMON` guard must stop the rc
+    /// from installing flyline's interactive editor hook inside the daemon. We
+    /// assert the effect directly — the `_flyline_edit` widget is absent — which
+    /// is deterministic and doesn't depend on the recursive editor's tty
+    /// behaviour. The daemon must still reach READY with the rc loaded.
+    ///
+    /// The rc writes two markers so a broken test can't pass silently: one
+    /// proves the rc was actually sourced (else ZDOTDIR wasn't honored and the
+    /// test is a no-op), the other is written only if `_flyline_edit` got
+    /// registered — i.e. the guard failed.
+    #[test]
+    fn daemon_rc_does_not_install_editor_hook() {
+        if !zsh_available() {
+            eprintln!("skipping flyline-rc daemon boot: zsh not available");
+            return;
+        }
+        // `-f` (no_rcs) skips the rc entirely, so the guard would never be
+        // exercised; this test only means something when the rc is loaded.
+        if no_rcs() {
+            eprintln!("skipping flyline-rc daemon boot: FLYLINE_ZSH_NO_RCS set");
+            return;
+        }
+
+        let zdotdir = std::env::temp_dir().join(format!(
+            "flyline-test-zdotdir-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&zdotdir).expect("create scratch ZDOTDIR");
+
+        let flyline_script = concat!(env!("CARGO_MANIFEST_DIR"), "/scripts/flyline.zsh");
+        let rc_marker = zdotdir.join("rc_sourced");
+        let hook_marker = zdotdir.join("editor_hook_installed");
+        let zshrc = zdotdir.join(".zshrc");
+        std::fs::write(
+            &zshrc,
+            format!(
+                "print -r -- sourced > {rc_marker:?}\n\
+                 source {flyline_script}\n\
+                 (( ${{+widgets[_flyline_edit]}} )) && print -r -- hooked > {hook_marker:?}\n",
+            ),
+        )
+        .expect("write scratch .zshrc");
+
+        let script_path = ZSH_BACKEND.daemon_script_path().to_path_buf();
+        let zdotdir_str = zdotdir.to_str().unwrap().to_string();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let result =
+                spawn_comp_daemon_with_env(&script_path, &[("ZDOTDIR", zdotdir_str.as_str())])
+                    .map(|_daemon| ());
+            let _ = tx.send(result);
+        });
+
+        let booted = rx.recv_timeout(DAEMON_BOOT_TIMEOUT + Duration::from_secs(5));
+        let rc_was_sourced = rc_marker.exists();
+        let editor_hook_installed = hook_marker.exists();
+        let _ = std::fs::remove_dir_all(&zdotdir);
+
+        assert!(
+            rc_was_sourced,
+            "scratch rc was not sourced — ZDOTDIR not honored, test is a no-op",
+        );
+        booted
+            .expect("daemon boot did not resolve in time")
+            .expect("daemon should reach READY with a flyline-enabled rc");
+        assert!(
+            !editor_hook_installed,
+            "FLYLINE_ZSH_DAEMON guard failed: the daemon's rc installed the \
+             _flyline_edit line-init hook",
         );
     }
 
