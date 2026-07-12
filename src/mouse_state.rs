@@ -36,6 +36,12 @@ impl crossterm::Command for PointerShape {
 
 pub struct MouseState {
     enabled: bool,
+    /// Whether the configured mode wants mouse capture on. Capture is enabled
+    /// lazily (see `enable_if_configured`) *after* the inline viewport is set up,
+    /// so the terminal's `ESC[6n` cursor-position probe at startup can't race an
+    /// incoming mouse report — an interleaved report would otherwise have its
+    /// tail (e.g. `35;96;35M`) leak onto the shell as literal text.
+    desired_enabled: bool,
     last_left_click_times: Vec<std::time::Instant>,
     last_left_click_buffer_pos: Option<usize>,
     /// True while the left mouse button is currently being held down.
@@ -53,30 +59,18 @@ pub struct MouseState {
 }
 
 impl MouseState {
-    /// Initialize mouse state for the given mode, immediately enabling mouse capture
-    /// (via crossterm) when appropriate.
+    /// Initialize mouse state for the given mode *without* emitting any terminal
+    /// escapes yet. Capture is turned on later via [`enable_if_configured`], once
+    /// the inline viewport is established, to avoid racing the startup
+    /// cursor-position probe (see `desired_enabled`).
     pub fn initialize(mode: &MouseMode) -> Self {
-        let enabled = match mode {
+        let desired_enabled = match mode {
             MouseMode::Disabled => false,
-            MouseMode::Simple | MouseMode::Smart => {
-                match crossterm::execute!(
-                    std::io::stdout(),
-                    crossterm::event::EnableMouseCapture,
-                    XtShiftEscape::Enable
-                ) {
-                    Ok(_) => {
-                        log::trace!("Mouse capture enabled: initial setup for {:?} mode", mode);
-                        true
-                    }
-                    Err(e) => {
-                        log::error!("Failed to enable mouse capture on init: {}", e);
-                        false
-                    }
-                }
-            }
+            MouseMode::Simple | MouseMode::Smart => true,
         };
         MouseState {
-            enabled,
+            enabled: false,
+            desired_enabled,
             last_left_click_times: Vec::new(),
             last_left_click_buffer_pos: None,
             left_button_down: false,
@@ -86,6 +80,15 @@ impl MouseState {
             drag_start_tag: None,
             current_pointer_shape: PointerShape::Default,
             right_click_down_pos: None,
+        }
+    }
+
+    /// Enable mouse capture if the configured mode wants it. Called once after
+    /// the terminal viewport is ready, so no mouse report can arrive before the
+    /// event loop is running to consume it.
+    pub fn enable_if_configured(&mut self) {
+        if self.desired_enabled {
+            self.enable();
         }
     }
 

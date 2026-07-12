@@ -583,6 +583,11 @@ impl<'a> App<'a> {
             terminal
         });
 
+        // Enable mouse capture only now that the inline viewport (and its
+        // cursor-position probe) is established. Doing it earlier lets a mouse
+        // report race the probe and leak its tail (e.g. `35;96;35M`) as text.
+        self.mouse_state.enable_if_configured();
+
         let mut redraw = true;
         let mut last_terminal_size = terminal.size().unwrap();
 

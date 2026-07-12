@@ -5,7 +5,7 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicPtr, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -79,6 +79,208 @@ pub fn set_cloexec(fd: std::os::fd::RawFd) {
         let flags = libc::fcntl(fd, libc::F_GETFD);
         if flags != -1 {
             libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC);
+        }
+    }
+}
+
+/// Fatal-signal terminal restoration state, read only from the signal handler.
+///
+/// A `flyline-standalone` editor killed by a fatal signal (e.g. `SIGHUP` when
+/// the terminal window closes mid-edit, or an external `SIGTERM`) never runs its
+/// normal/panic terminal restore, so it would leave the tty in raw mode with
+/// mouse tracking, bracketed paste, etc. still enabled — and those modes persist
+/// on the terminal device across process death, leaking into later shells. The
+/// handler below performs an async-signal-safe restore before re-raising.
+static RESTORE_TTY_FD: AtomicI32 = AtomicI32::new(-1);
+static RESTORE_TERMIOS_PTR: AtomicPtr<libc::termios> = AtomicPtr::new(std::ptr::null_mut());
+static RESTORE_POP_KEYBOARD: AtomicBool = AtomicBool::new(false);
+
+/// Escape sequences mirroring `App::restore_terminal`'s terminal-feature reset:
+/// disable SGR/urxvt/any-motion/button/normal mouse tracking, xterm shift-escape,
+/// bracketed paste and focus reporting; reset pointer shape; show the cursor.
+const RESTORE_TERMINAL_SEQ: &[u8] = b"\x1b[?1006l\x1b[?1015l\x1b[?1003l\x1b[?1002l\x1b[?1000l\x1b[>0s\x1b[?2004l\x1b[?1004l\x1b]22;default\x1b\\\x1b[?25h";
+/// Pop one keyboard-enhancement stack entry (only pushed when extended key codes
+/// are enabled), matching `PopKeyboardEnhancementFlags`.
+const RESTORE_KEYBOARD_POP_SEQ: &[u8] = b"\x1b[<u";
+
+/// Async-signal-safe: only calls `tcsetattr`, `write`, `signal`, and `raise`,
+/// all of which are on the POSIX async-signal-safe list, and reads process
+/// globals through atomics. Restores the terminal, then re-raises the signal
+/// with the default disposition so the exit status reflects it.
+extern "C" fn restore_terminal_signal_handler(signum: libc::c_int) {
+    let fd = RESTORE_TTY_FD.load(Ordering::SeqCst);
+    if fd >= 0 {
+        // SAFETY: async-signal-safe libc calls on a fd we opened and a termios we
+        // captured before installing the handler.
+        unsafe {
+            let termios_ptr = RESTORE_TERMIOS_PTR.load(Ordering::SeqCst);
+            if !termios_ptr.is_null() {
+                libc::tcsetattr(fd, libc::TCSANOW, termios_ptr);
+            }
+            libc::write(
+                fd,
+                RESTORE_TERMINAL_SEQ.as_ptr().cast(),
+                RESTORE_TERMINAL_SEQ.len(),
+            );
+            if RESTORE_POP_KEYBOARD.load(Ordering::SeqCst) {
+                libc::write(
+                    fd,
+                    RESTORE_KEYBOARD_POP_SEQ.as_ptr().cast(),
+                    RESTORE_KEYBOARD_POP_SEQ.len(),
+                );
+            }
+        }
+    }
+    // SAFETY: reset to default and re-raise so we terminate with signal semantics.
+    unsafe {
+        libc::signal(signum, libc::SIG_DFL);
+        libc::raise(signum);
+    }
+}
+
+/// Ensures the standalone editor owns the controlling terminal's foreground
+/// process group while it draws, restoring the previous owner and signal
+/// dispositions on drop.
+///
+/// Why this exists: the editor is launched from a `zle-line-init` widget via
+/// command substitution and normally shares zsh's foreground process group, so
+/// terminal I/O just works. But if the terminal's foreground process group is
+/// momentarily wrong at launch, the very first tty write — ratatui's `ESC[6n`
+/// cursor-position query during inline-viewport setup — raises `SIGTTOU` and the
+/// process is *stopped* (state `T`). Nothing ever sends `SIGCONT`, so the parent
+/// `$( "$FLYLINE_BIN" ... )` blocks forever and the shell appears to hang. This
+/// was observed specifically on the re-install path: `exec zsh` restarts the
+/// shell in the same terminal while orphaned helper daemons from the previous
+/// session are still around, so the foreground group is briefly not ours.
+///
+/// The Bash builtin never hits this because Bash calls `give_terminal_to()`
+/// before invoking the editor. This reproduces that protection for the
+/// standalone binary: ignore the job-control stop signals (so `tcsetpgrp` and
+/// the cursor query cannot stop us) and claim the terminal for our own group.
+pub struct StandaloneTerminalGuard {
+    tty_fd: libc::c_int,
+    prev_fg_pgrp: libc::pid_t,
+    claimed: bool,
+    prev_sigttou: libc::sighandler_t,
+    prev_sigttin: libc::sighandler_t,
+    prev_sigtstp: libc::sighandler_t,
+    prev_sighup: libc::sighandler_t,
+    prev_sigterm: libc::sighandler_t,
+    prev_sigint: libc::sighandler_t,
+    prev_sigquit: libc::sighandler_t,
+}
+
+impl StandaloneTerminalGuard {
+    /// Install the guard. Safe to call even without a controlling terminal (it
+    /// simply skips the `tcsetpgrp` handoff in that case). Always returns a guard
+    /// so the caller keeps it alive for the editor's lifetime. `extended_key_codes`
+    /// mirrors the setting so the fatal-signal restore can pop the keyboard
+    /// enhancement flags the editor pushed.
+    pub fn install(extended_key_codes: bool) -> Self {
+        // Ignore the job-control stop signals first, so the subsequent
+        // `tcsetpgrp` (and any tty write) cannot stop us if we start out in a
+        // background process group.
+        // SAFETY: `signal(2)` only swaps the signal disposition. The standalone
+        // editor is single-threaded at this point and no thread relies on the
+        // default disposition of these signals.
+        let prev_sigttou = unsafe { libc::signal(libc::SIGTTOU, libc::SIG_IGN) };
+        let prev_sigttin = unsafe { libc::signal(libc::SIGTTIN, libc::SIG_IGN) };
+        let prev_sigtstp = unsafe { libc::signal(libc::SIGTSTP, libc::SIG_IGN) };
+
+        // Prefer the controlling terminal explicitly; the widget wires fds 0/1/2
+        // to /dev/tty, but opening it directly is unambiguous.
+        // SAFETY: standard libc calls with a NUL-terminated literal path.
+        let mut tty_fd =
+            unsafe { libc::open(c"/dev/tty".as_ptr(), libc::O_RDWR | libc::O_CLOEXEC) };
+        if tty_fd < 0 {
+            tty_fd = libc::STDIN_FILENO;
+        }
+
+        // Publish the restore state, then install fatal-signal handlers that use
+        // it. Capture the (still cooked) termios now, before the editor enables
+        // raw mode, so the handler can hand back a usable terminal. The termios
+        // box is intentionally leaked: the handler may run at any time and the
+        // process exits right after the editor returns, so freeing it would only
+        // risk a use-after-free for no practical gain.
+        // SAFETY: `tcgetattr` fills the allocation; `signal(2)` swaps handlers.
+        unsafe {
+            let termios_box = Box::new(std::mem::zeroed::<libc::termios>());
+            let termios_ptr = Box::into_raw(termios_box);
+            if libc::tcgetattr(tty_fd, termios_ptr) != 0 {
+                drop(Box::from_raw(termios_ptr));
+                RESTORE_TERMIOS_PTR.store(std::ptr::null_mut(), Ordering::SeqCst);
+            } else {
+                RESTORE_TERMIOS_PTR.store(termios_ptr, Ordering::SeqCst);
+            }
+            RESTORE_TTY_FD.store(tty_fd, Ordering::SeqCst);
+            RESTORE_POP_KEYBOARD.store(extended_key_codes, Ordering::SeqCst);
+        }
+
+        let handler = restore_terminal_signal_handler as extern "C" fn(libc::c_int) as usize;
+        // SAFETY: installing a signal handler backed by process globals set above.
+        let (prev_sighup, prev_sigterm, prev_sigint, prev_sigquit) = unsafe {
+            (
+                libc::signal(libc::SIGHUP, handler),
+                libc::signal(libc::SIGTERM, handler),
+                libc::signal(libc::SIGINT, handler),
+                libc::signal(libc::SIGQUIT, handler),
+            )
+        };
+
+        let mut guard = Self {
+            tty_fd,
+            prev_fg_pgrp: -1,
+            claimed: false,
+            prev_sigttou,
+            prev_sigttin,
+            prev_sigtstp,
+            prev_sighup,
+            prev_sigterm,
+            prev_sigint,
+            prev_sigquit,
+        };
+
+        // SAFETY: `tcgetpgrp`/`getpgrp`/`tcsetpgrp` are simple libc calls.
+        unsafe {
+            let prev = libc::tcgetpgrp(tty_fd);
+            let ours = libc::getpgrp();
+            if prev >= 0 && ours >= 0 {
+                guard.prev_fg_pgrp = prev;
+                if prev != ours && libc::tcsetpgrp(tty_fd, ours) == 0 {
+                    guard.claimed = true;
+                }
+            }
+        }
+
+        guard
+    }
+}
+
+impl Drop for StandaloneTerminalGuard {
+    fn drop(&mut self) {
+        // SAFETY: restoring the prior foreground group and signal dispositions.
+        unsafe {
+            // Restore the fatal-signal handlers first, then stop pointing the
+            // (about-to-close) fd at the handler, so it can't fire against a
+            // stale fd once the editor is done.
+            libc::signal(libc::SIGHUP, self.prev_sighup);
+            libc::signal(libc::SIGTERM, self.prev_sigterm);
+            libc::signal(libc::SIGINT, self.prev_sigint);
+            libc::signal(libc::SIGQUIT, self.prev_sigquit);
+            RESTORE_TTY_FD.store(-1, Ordering::SeqCst);
+
+            // Only hand the terminal back if we took it, so we leave it exactly
+            // as we found it. zsh's own job control also reclaims it for the next
+            // prompt, so this is belt-and-suspenders.
+            if self.claimed && self.prev_fg_pgrp >= 0 {
+                libc::tcsetpgrp(self.tty_fd, self.prev_fg_pgrp);
+            }
+            libc::signal(libc::SIGTTOU, self.prev_sigttou);
+            libc::signal(libc::SIGTTIN, self.prev_sigttin);
+            libc::signal(libc::SIGTSTP, self.prev_sigtstp);
+            if self.tty_fd != libc::STDIN_FILENO {
+                libc::close(self.tty_fd);
+            }
         }
     }
 }

@@ -87,7 +87,7 @@ pub use cli::run_flyline_command;
 #[cfg(feature = "standalone")]
 pub use settings::Settings;
 #[cfg(feature = "standalone")]
-pub use shell::zsh::{ZSH_BACKEND, run_comp_broker, set_cloexec};
+pub use shell::zsh::{StandaloneTerminalGuard, ZSH_BACKEND, run_comp_broker, set_cloexec};
 #[cfg(feature = "standalone")]
 pub use shell::{backend, is_zsh_host_env, set_backend};
 

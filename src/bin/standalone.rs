@@ -7,8 +7,8 @@
 //!   1   — EOF or internal error
 
 use flyline::{
-    ExitState, ZSH_BACKEND, backend, get_command, init_standalone_logging, run_comp_broker,
-    run_flyline_command, set_backend, set_cloexec,
+    ExitState, StandaloneTerminalGuard, ZSH_BACKEND, backend, get_command, init_standalone_logging,
+    run_comp_broker, run_flyline_command, set_backend, set_cloexec,
 };
 
 fn catch_unwind_safe<T>(f: impl FnOnce() -> T) -> Result<T, ()> {
@@ -75,6 +75,17 @@ fn run() -> i32 {
     if let Ok(init) = std::env::var("FLYLINE_INIT") {
         settings.initial_buffer = Some(init);
     }
+
+    // Claim the controlling terminal's foreground process group before drawing.
+    // Without this, a wrong foreground group at launch (seen right after a
+    // re-install, when `exec zsh` restarts the shell alongside orphaned helper
+    // daemons) makes the first tty write raise SIGTTOU and stops us forever,
+    // hanging the parent shell. The guard also installs fatal-signal handlers
+    // that restore the terminal (raw mode, mouse tracking, ...) if the editor is
+    // killed, so it never leaves the tty in a mode that leaks into later shells.
+    // The Bash builtin gets both for free via Bash. Held until the editor
+    // returns, then dropped.
+    let _terminal_guard = StandaloneTerminalGuard::install(settings.enable_extended_key_codes);
 
     let exit_code = match get_command(&mut settings) {
         ExitState::WithCommand(cmd) => {

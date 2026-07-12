@@ -2,6 +2,11 @@ pub(crate) const CHANGELOG: &str = r#"# Changelog
 
 # flyline-multishell fork
 
+## v1.0.2
+- **Fixed a shell hang when running `exec zsh` after re-install (only)**: The standalone zsh editor now claims the controlling terminal's foreground process group before drawing, so running `exec zsh` in the same terminal right after a (re)install no longer stops flyline on `SIGTTOU` and wedges the shell until a new tab is opened.
+- **improved mouse escape sequence handling**: makes sure mouse capture is enabled only after the viewport is established.
+- **Reliable terminal restore on interruption**: The standalone zsh editor now restores the terminal (raw mode, mouse tracking, bracketed paste, cursor) if it is killed by a fatal signal such as `SIGHUP`/`SIGTERM`, so an interrupted edit can no longer leave the terminal emitting stray escape sequences.
+
 ## v1.0.1
 - **Complete Uninstall**: `install.sh --uninstall` now removes both Bash and zsh startup integration along with installed executables, libraries, scripts, and release metadata.
 - **Clear Uninstall Guidance**: The installer reports exactly what it removed and explains how to unload commands already resident in existing Bash and zsh sessions.
