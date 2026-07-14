@@ -402,14 +402,17 @@ jobs:
       matrix:
         # Validate the distro/Bash matrix on x86_64 and exercise the published
         # aarch64 GNU archive natively on GitHub's ARM64 hosted runners.
+        # dep_cache_target/dep_cache_scope reuse a heavy linked-context layer
+        # that ci.yml already exports to the GHA cache on every master push
+        # (currently only the from-source Bash 3.2.57 build).
         include:
-          - { target: install-test-alpine,        runner: ubuntu-latest,   label: alpine-x86_64 }
-          - { target: install-test-ubuntu,        runner: ubuntu-latest,   label: ubuntu-x86_64 }
-          - { target: install-test-arch,          runner: ubuntu-latest,   label: arch-x86_64 }
-          - { target: install-test-bash-3-2-57,   runner: ubuntu-latest,   label: bash-3.2-x86_64 }
-          - { target: install-test-release-zsh,   runner: ubuntu-latest,   label: zsh-x86_64 }
-          - { target: install-test-ubuntu,        runner: ubuntu-24.04-arm, label: ubuntu-arm64 }
-          - { target: install-test-release-zsh,   runner: ubuntu-24.04-arm, label: zsh-arm64 }
+          - { target: install-test-alpine,        runner: ubuntu-latest,   label: alpine-x86_64,   dep_cache_target: "",                          dep_cache_scope: "" }
+          - { target: install-test-ubuntu,        runner: ubuntu-latest,   label: ubuntu-x86_64,   dep_cache_target: "",                          dep_cache_scope: "" }
+          - { target: install-test-arch,          runner: ubuntu-latest,   label: arch-x86_64,     dep_cache_target: "",                          dep_cache_scope: "" }
+          - { target: install-test-bash-3-2-57,   runner: ubuntu-latest,   label: bash-3.2-x86_64, dep_cache_target: specific-bash-version-3_2_57, dep_cache_scope: bash-3_2_57 }
+          - { target: install-test-release-zsh,   runner: ubuntu-latest,   label: zsh-x86_64,      dep_cache_target: "",                          dep_cache_scope: "" }
+          - { target: install-test-ubuntu,        runner: ubuntu-24.04-arm, label: ubuntu-arm64,   dep_cache_target: "",                          dep_cache_scope: "" }
+          - { target: install-test-release-zsh,   runner: ubuntu-24.04-arm, label: zsh-arm64,      dep_cache_target: "",                          dep_cache_scope: "" }
     steps:
       - name: Checkout
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
@@ -471,15 +474,37 @@ jobs:
           [ -n "$gw" ] || gw="172.17.0.1"
           echo "FLYLINE_ASSET_BASE=http://${gw}:8080/${TAG}" >> "$GITHUB_ENV"
 
+      # Cache the installer image layers in the GHA cache. The from-source
+      # Bash 3.2.57 build is the dominant test-install cost (~130s) and is
+      # rebuilt every run; ci.yml already exports it to scope bash-3_2_57 on
+      # master, so we read that here and each target also keeps its own scope so
+      # base/apt layers survive reruns. No GHCR login or extra permissions.
       - name: Run installer test
         env:
           FLYLINE_INSTALL_VERSION: ${{ needs.setup.outputs.tag }}
+          TARGET: ${{ matrix.target }}
+          SCOPE: install-${{ matrix.label }}
+          DEP_CACHE_TARGET: ${{ matrix.dep_cache_target }}
+          DEP_CACHE_SCOPE: ${{ matrix.dep_cache_scope }}
         run: |
           set -euo pipefail
-          echo "Testing ${{ matrix.target }} against ${FLYLINE_ASSET_BASE}/${FLYLINE_INSTALL_VERSION}"
-          docker buildx bake -f docker-bake.hcl "${{ matrix.target }}" \
-            --set "*.args.FLYLINE_INSTALL_VERSION=${FLYLINE_INSTALL_VERSION}" \
+          echo "Testing ${TARGET} against ${FLYLINE_ASSET_BASE}/${FLYLINE_INSTALL_VERSION}"
+          bake_args=(
+            --set "*.args.FLYLINE_INSTALL_VERSION=${FLYLINE_INSTALL_VERSION}"
             --set "*.args.FLYLINE_ASSET_BASE=${FLYLINE_ASSET_BASE}"
+            --set "${TARGET}.cache-from=type=gha,scope=${SCOPE}"
+            --set "${TARGET}.cache-to=type=gha,scope=${SCOPE},mode=max"
+          )
+          # Reuse the heavy linked-context layer cached by ci.yml (e.g. compiled
+          # Bash), and self-populate it so reruns hit even if ci.yml's cache is
+          # absent or evicted.
+          if [ -n "${DEP_CACHE_TARGET}" ]; then
+            bake_args+=(
+              --set "${DEP_CACHE_TARGET}.cache-from=type=gha,scope=${DEP_CACHE_SCOPE}"
+              --set "${DEP_CACHE_TARGET}.cache-to=type=gha,scope=${DEP_CACHE_SCOPE},mode=max"
+            )
+          fi
+          docker buildx bake -f docker-bake.hcl "${TARGET}" "${bake_args[@]}"
 
       - name: Stop asset server
         if: always()
