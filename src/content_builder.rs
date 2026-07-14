@@ -197,6 +197,7 @@ pub enum Tag {
     MultiWidthContinuation,
     FlycompYes,
     FlycompNo,
+    FlycompShowFiles,
     FlycompDontAsk,
     FlycompSandboxInfo,
     FlycompInfo,

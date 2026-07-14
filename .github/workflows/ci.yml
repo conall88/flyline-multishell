@@ -7,24 +7,57 @@ on:
     branches: [ "**" ]
   workflow_dispatch:
 
+# Branch/PR-specific grouping so independent refs run concurrently, while a new
+# push to the same branch or PR cancels the superseded in-flight run.
+# For pull_request events github.ref is refs/pull/<n>/merge (unique per PR);
+# for push events it is refs/heads/<branch>.
 concurrency:
-  group: ci
-  cancel-in-progress: false
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
+# Least-privilege default. Only the jobs that write registry cache to GHCR opt
+# into packages: write below.
 permissions:
   contents: read
-  packages: write
 
 jobs:
+  # Compute whether this event is "trusted" (may log in to GHCR and write
+  # registry/GHA cache). Untrusted = a pull_request from a fork OR from
+  # dependabot; those get read-only/GHA cache and never touch GHCR credentials.
+  meta:
+    name: Determine event trust
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      trusted: ${{ steps.trust.outputs.trusted }}
+    steps:
+      - name: Compute trust for cache/registry access
+        id: trust
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+          BASE_REPO: ${{ github.repository }}
+          ACTOR: ${{ github.actor }}
+        run: |
+          if [ "$EVENT_NAME" != "pull_request" ] || { [ "$HEAD_REPO" = "$BASE_REPO" ] && [ "$ACTOR" != "dependabot[bot]" ]; }; then
+            echo "trusted=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "trusted=false" >> "$GITHUB_OUTPUT"
+          fi
+
   build-ubuntu-1604:
     name: Build and test on Ubuntu 16.04
     runs-on: ubuntu-latest
+    needs: meta
+    permissions:
+      contents: read
     steps:
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v4
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4
 
       - name: Build
-        uses: docker/bake-action@v7
+        uses: docker/bake-action@d3418bd7d0e9324001bca92fa8ba175ea7e6dc9b # v7
         with:
           files: docker-bake.hcl
           targets: |
@@ -34,21 +67,81 @@ jobs:
           set: |
             extract-integration-test-build-artifact.output=type=local,dest=${{ runner.temp }}/docker/build
             extract-pre-bash-4-4-integration-test-build-artifact.output=type=local,dest=${{ runner.temp }}/docker/build-pre-bash-4-4
-            *.cache-from=type=gha
-            *.cache-to=type=gha,mode=max
+            *.cache-from=type=gha,scope=ci-builder-amd64
+            ${{ needs.meta.outputs.trusted == 'true' && '*.cache-to=type=gha,scope=ci-builder-amd64,mode=max' || '' }}
 
-      - name: Save built library artifact
-        uses: actions/upload-artifact@v7
+      # NOTE: The built libflyline.so is intentionally NOT uploaded as a workflow
+      # artifact. Downstream jobs (bash-integration-tests, zsh-integration-tests,
+      # host-integration-tests) rebuild it through BuildKit and pull the compiled
+      # layers from the type=gha cache populated above, so an uploaded artifact
+      # would be dead weight that nothing consumes.
+
+  # Standalone startup + zsh completion coverage. These tests need the real
+  # compiled binary but no interactive pty, so they run inside a dedicated
+  # Docker build stage (flyline-host-integration-tests) rather than the runner.
+  host-integration-tests:
+    name: Standalone startup + zsh completion tests (ARM64)
+    runs-on: ubuntu-24.04-arm
+    needs:
+      - meta
+      - build-ubuntu-1604
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4
+
+      # build-push-action runs the RUN layers of the target stage (which execute
+      # the tests); a failing test fails the build and thus the job. It also
+      # auto-injects GHA cache credentials, so type=gha cache works without extra
+      # setup. cache-to is only written for trusted events.
+      - name: Run standalone_startup_tests and zsh_completion_tests
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
-          name: built-flyline-library
-          path: ${{ runner.temp }}/docker/build/libflyline.so
+          context: .
+          file: docker/builder.Dockerfile
+          target: flyline-host-integration-tests
+          push: false
+          cache-from: type=gha,scope=ci-builder-arm64
+          cache-to: ${{ needs.meta.outputs.trusted == 'true' && 'type=gha,scope=ci-builder-arm64,mode=max' || '' }}
 
+  # Zsh integration coverage. The bake target's Dockerfile runs an interactive
+  # zsh session, but the pty is created inside the container via zsh/zpty, so no
+  # runner-level pty allocation is required here.
+  zsh-integration-tests:
+    name: Zsh integration tests (ARM64)
+    runs-on: ubuntu-24.04-arm
+    needs:
+      - meta
+      - build-ubuntu-1604
+    permissions:
+      contents: read
+    steps:
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4
+
+      - name: Run zsh integration tests
+        uses: docker/bake-action@d3418bd7d0e9324001bca92fa8ba175ea7e6dc9b # v7
+        with:
+          files: docker-bake.hcl
+          targets: zsh-integration-test
+          set: |
+            *.cache-from=type=gha,scope=ci-builder-arm64
+            ${{ needs.meta.outputs.trusted == 'true' && '*.cache-to=type=gha,scope=ci-builder-arm64,mode=max' || '' }}
 
   bash-integration-tests:
     name: Bash integration tests using built library
     runs-on: ubuntu-latest
     needs:
+      - meta
       - build-ubuntu-1604
+    permissions:
+      contents: read
+      # Needed to push the writable GHCR registry cache on trusted events.
+      packages: write
     strategy:
       fail-fast: false
       matrix:
@@ -56,10 +149,13 @@ jobs:
 
     steps:
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v4
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4
 
+      # Only trusted events log in to GHCR; fork/dependabot PRs never touch
+      # registry credentials.
       - name: Login to GHCR
-        uses: docker/login-action@v4
+        if: needs.meta.outputs.trusted == 'true'
+        uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0 # v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -67,28 +163,36 @@ jobs:
 
       - name: Set lower case owner name
         run: |
-          echo "OWNER_LC=${OWNER,,}" >>${GITHUB_ENV}
+          echo "OWNER_LC=${OWNER,,}" >> "$GITHUB_ENV"
         env:
           OWNER: '${{ github.repository_owner }}'
 
+      # Trusted events use the writable GHCR registry cache (+ GHA cache write);
+      # untrusted fork/dependabot PRs fall back to read-only GHA cache only and
+      # skip the registry entirely.
       - name: Run integration tests
-        uses: docker/bake-action@v7
+        uses: docker/bake-action@d3418bd7d0e9324001bca92fa8ba175ea7e6dc9b # v7
         with:
           files: docker-bake.hcl
           targets: bash-integration-test-${{ matrix.bash_version_slug }}
           set: |
-            specific-bash-version-${{ matrix.bash_version_slug }}.cache-from=type=registry,ref=ghcr.io/${{ env.OWNER_LC }}/bash-${{ matrix.bash_version_slug }}:cache
-            specific-bash-version-${{ matrix.bash_version_slug }}.cache-to=type=registry,ref=ghcr.io/${{ env.OWNER_LC }}/bash-${{ matrix.bash_version_slug }}:cache,mode=min
-            bash-integration-test-${{ matrix.bash_version_slug }}.cache-from=type=gha
-            bash-integration-test-${{ matrix.bash_version_slug }}.cache-to=type=gha,mode=max
-            built-artifact.cache-from=type=gha
-            built-artifact.cache-to=type=gha,mode=max
+            ${{ needs.meta.outputs.trusted == 'true' && format('specific-bash-version-{0}.cache-from=type=registry,ref=ghcr.io/{1}/bash-{0}:cache', matrix.bash_version_slug, env.OWNER_LC) || '' }}
+            ${{ needs.meta.outputs.trusted == 'true' && format('specific-bash-version-{0}.cache-to=type=registry,ref=ghcr.io/{1}/bash-{0}:cache,mode=min', matrix.bash_version_slug, env.OWNER_LC) || '' }}
+            bash-integration-test-${{ matrix.bash_version_slug }}.cache-from=type=gha,scope=bash-${{ matrix.bash_version_slug }}
+            ${{ needs.meta.outputs.trusted == 'true' && format('bash-integration-test-{0}.cache-to=type=gha,scope=bash-{0},mode=max', matrix.bash_version_slug) || '' }}
+            built-artifact.cache-from=type=gha,scope=ci-builder-amd64
+            ${{ needs.meta.outputs.trusted == 'true' && 'built-artifact.cache-to=type=gha,scope=ci-builder-amd64,mode=max' || '' }}
 
   bash-integration-tests-pre-4-4:
     name: Bash integration tests (pre-4.4) using built library
     runs-on: ubuntu-latest
     needs:
+      - meta
       - build-ubuntu-1604
+    permissions:
+      contents: read
+      # Needed to push the writable GHCR registry cache on trusted events.
+      packages: write
     strategy:
       fail-fast: false
       matrix:
@@ -96,10 +200,11 @@ jobs:
 
     steps:
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v4
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4
 
       - name: Login to GHCR
-        uses: docker/login-action@v4
+        if: needs.meta.outputs.trusted == 'true'
+        uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0 # v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -107,20 +212,19 @@ jobs:
 
       - name: Set lower case owner name
         run: |
-          echo "OWNER_LC=${OWNER,,}" >>${GITHUB_ENV}
+          echo "OWNER_LC=${OWNER,,}" >> "$GITHUB_ENV"
         env:
           OWNER: '${{ github.repository_owner }}'
 
       - name: Run integration tests
-        uses: docker/bake-action@v7
+        uses: docker/bake-action@d3418bd7d0e9324001bca92fa8ba175ea7e6dc9b # v7
         with:
           files: docker-bake.hcl
           targets: bash-integration-test-${{ matrix.bash_version_slug }}
           set: |
-            specific-bash-version-${{ matrix.bash_version_slug }}.cache-from=type=registry,ref=ghcr.io/${{ env.OWNER_LC }}/bash-${{ matrix.bash_version_slug }}:cache
-            specific-bash-version-${{ matrix.bash_version_slug }}.cache-to=type=registry,ref=ghcr.io/${{ env.OWNER_LC }}/bash-${{ matrix.bash_version_slug }}:cache,mode=min
-            bash-integration-test-${{ matrix.bash_version_slug }}.cache-from=type=gha
-            bash-integration-test-${{ matrix.bash_version_slug }}.cache-to=type=gha,mode=max
-            built-artifact.cache-from=type=gha
-            built-artifact.cache-to=type=gha,mode=max
-
+            ${{ needs.meta.outputs.trusted == 'true' && format('specific-bash-version-{0}.cache-from=type=registry,ref=ghcr.io/{1}/bash-{0}:cache', matrix.bash_version_slug, env.OWNER_LC) || '' }}
+            ${{ needs.meta.outputs.trusted == 'true' && format('specific-bash-version-{0}.cache-to=type=registry,ref=ghcr.io/{1}/bash-{0}:cache,mode=min', matrix.bash_version_slug, env.OWNER_LC) || '' }}
+            bash-integration-test-${{ matrix.bash_version_slug }}.cache-from=type=gha,scope=bash-${{ matrix.bash_version_slug }}
+            ${{ needs.meta.outputs.trusted == 'true' && format('bash-integration-test-{0}.cache-to=type=gha,scope=bash-{0},mode=max', matrix.bash_version_slug) || '' }}
+            built-artifact.cache-from=type=gha,scope=ci-builder-amd64
+            ${{ needs.meta.outputs.trusted == 'true' && 'built-artifact.cache-to=type=gha,scope=ci-builder-amd64,mode=max' || '' }}

@@ -1,0 +1,68 @@
+name: Bug Report
+description: File a bug report for flyline
+title: "[BUG]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        > [!IMPORTANT]
+        > Please make sure you are on the latest version of flyline!
+  - type: textarea
+    id: description
+    attributes:
+      label: Describe the Bug
+      description: A clear and concise description of what the bug is and what you expected to happen.
+      placeholder: Describe the bug here...
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment & Version Information
+      description: |
+        Copy version and env info by running this command in your terminal and pasting it below:
+        ```bash
+        flyline version --copy
+        ```
+      placeholder: Paste the output of 'flyline version --copy' here...
+      render: text
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Debug Logs (Optional / If Necessary)
+      description: |
+        Copy the logs if you think there's a chance they will help:
+        ```bash
+        # Run:
+        flyline log set-level debug
+
+        # Then recreate the issue
+
+        # Then copy logs and paste them here:
+        flyline log copy --last 10s
+        ```
+      value: |
+        <details>
+        <summary>Click to expand logs</summary>
+
+        ```text
+        <paste logs here>
+        ```
+
+        </details>
+    validations:
+      required: false
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Steps to Reproduce
+      description: Please describe the steps to reproduce the behavior.
+      placeholder: |
+        1. Go to '...'
+        2. Press keys '...'
+        3. See error '...'
+    validations:
+      required: true

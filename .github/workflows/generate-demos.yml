@@ -1,8 +1,6 @@
 name: Generate Demos
 
 on:
-  push:
-    branches: [ master ]
   workflow_dispatch:
 
 concurrency:
@@ -12,18 +10,21 @@ concurrency:
 jobs:
   generate-demos:
     name: Generate demos (GIFs and SVGs)
+    if: github.ref == 'refs/heads/master'
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
       - name: Checkout master branch
-        uses: actions/checkout@v7
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          ref: master
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v4
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4
 
       - name: Build demo GIFs and SVGs
-        uses: docker/bake-action@v7
+        uses: docker/bake-action@d3418bd7d0e9324001bca92fa8ba175ea7e6dc9b # v7
         with:
           files: docker-bake.hcl
           source: .
@@ -36,5 +37,14 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh release create assets --title "assets" --notes "Demo GIF storage" 2>/dev/null || true
-          gh release upload assets *.gif *.svg --clobber
+          if gh release view assets >/dev/null 2>&1; then
+            # Keep the documentation-only release out of GitHub's `latest`
+            # product-release calculation.
+            gh release edit assets --prerelease=true
+          else
+            gh release create assets \
+              --title "assets" \
+              --notes "Demo GIF storage" \
+              --prerelease
+          fi
+          gh release upload assets ./*.gif ./*.svg --clobber

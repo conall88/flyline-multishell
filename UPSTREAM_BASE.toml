@@ -1,0 +1,8 @@
+# Records the upstream project this fork is based on.
+# Update this file whenever changes from upstream are merged into the fork:
+# bump `release`/`commit` to the newest upstream point that has been integrated.
+
+[upstream]
+repository = "HalFrgrd/flyline"
+release = "v1.3.0"
+commit = "339e8bf1699064a314783c05e65593664f611a04"

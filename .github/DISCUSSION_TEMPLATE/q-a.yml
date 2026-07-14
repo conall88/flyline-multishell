@@ -1,0 +1,28 @@
+title: "[Q&A]: "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        > [!IMPORTANT]
+        > Please make sure you are on the latest version of flyline!
+  - type: textarea
+    id: question
+    attributes:
+      label: What is your question, suggestion, or problem?
+      description: Please describe the question, help request, or behavior you are experiencing.
+      placeholder: Write your question or problem here...
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment & Version Information (If Relevant)
+      description: |
+        Copy version and env info by running this command in your terminal and pasting it below:
+        ```bash
+        flyline version --copy
+        ```
+      placeholder: Paste the output of 'flyline version --copy' here...
+      render: text
+    validations:
+      required: false

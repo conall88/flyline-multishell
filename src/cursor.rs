@@ -13,7 +13,9 @@ use strum::{AsRefStr, EnumString, VariantArray};
 pub const CURSOR_INTENSITY_UNFOCUSED: u8 = 80;
 
 /// Which backend renders the cursor.
-#[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(
+    ValueEnum, Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize,
+)]
 pub enum CursorBackend {
     /// Flyline renders a custom cursor.
     #[default]
@@ -26,7 +28,19 @@ pub enum CursorBackend {
 ///
 /// Corresponds to the standard easings from the `easing-function` crate:
 /// <https://docs.rs/easing-function/latest/easing_function/easings/index.html>
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, AsRefStr, VariantArray, EnumString)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Default,
+    AsRefStr,
+    VariantArray,
+    EnumString,
+    serde::Serialize,
+    serde::Deserialize,
+)]
 #[strum(serialize_all = "kebab-case")]
 pub enum CursorEasing {
     #[default]
@@ -163,7 +177,9 @@ pub fn cursor_effect_animation_frames(
 }
 
 /// Visual effect applied to the cursor.
-#[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(
+    ValueEnum, Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize,
+)]
 pub enum CursorEffect {
     /// Smoothly oscillate the cursor brightness (default).
     #[default]
@@ -175,7 +191,7 @@ pub enum CursorEffect {
 }
 
 /// How the cursor should be styled.
-#[derive(Debug, Clone, PartialEq, Default)]
+#[derive(Debug, Clone, PartialEq, Default, serde::Serialize, serde::Deserialize)]
 pub enum CursorStyleConfig {
     /// Default: an intensity-modulated grey/white block (original flyline cursor).
     #[default]
@@ -188,10 +204,11 @@ pub enum CursorStyleConfig {
 }
 
 /// Complete cursor configuration set by `flyline set-cursor`.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct CursorConfig {
-    /// Which backend renders the cursor.
-    pub backend: CursorBackend,
+    /// Which backend renders the cursor.  If `None`, the default is resolved
+    /// dynamically based on terminal emulator checks.
+    backend: Option<CursorBackend>,
     /// Interpolation speed.  `None` disables position
     /// interpolation and the cursor jumps instantly to its target.
     /// Default is `Some(16.0)`.
@@ -208,10 +225,43 @@ pub struct CursorConfig {
     pub effect_easing: CursorEasing,
 }
 
+static IS_KITTY: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+    let term = crate::bash_funcs::get_envvar_value("TERM").unwrap_or_default();
+    let term_program = crate::bash_funcs::get_envvar_value("TERM_PROGRAM").unwrap_or_default();
+    term.to_lowercase().contains("xterm-kitty") || term_program.to_lowercase().contains("kitty")
+});
+
+fn detect_kitty() -> bool {
+    *IS_KITTY
+}
+
+impl CursorConfig {
+    /// Resolves the cursor backend to use, defaulting to `Terminal` on Kitty and `Flyline` otherwise.
+    pub fn backend(&self) -> CursorBackend {
+        self.backend.unwrap_or_else(|| {
+            if detect_kitty() {
+                CursorBackend::Terminal
+            } else {
+                CursorBackend::Flyline
+            }
+        })
+    }
+
+    /// Sets the cursor rendering backend.
+    pub fn set_backend(&mut self, backend: Option<CursorBackend>) {
+        self.backend = backend;
+    }
+
+    /// Returns `true` if no backend has been explicitly configured.
+    pub fn is_backend_unset(&self) -> bool {
+        self.backend.is_none()
+    }
+}
+
 impl Default for CursorConfig {
     fn default() -> Self {
         Self {
-            backend: CursorBackend::Flyline,
+            backend: None,
             interpolate: Some(16.0),
             interpolate_easing: CursorEasing::Linear,
             style: CursorStyleConfig::Default,

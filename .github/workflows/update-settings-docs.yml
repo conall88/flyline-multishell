@@ -1,8 +1,6 @@
 name: Update Settings Documentation
 
 on:
-  push:
-    branches: [ master ]
   workflow_dispatch:
 
 concurrency:
@@ -12,19 +10,22 @@ concurrency:
 jobs:
   update-settings-docs:
     name: Regenerate flyline --help text and update README
+    if: github.ref == 'refs/heads/master'
     runs-on: ubuntu-latest
     permissions:
       contents: write
       pull-requests: write
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          ref: master
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v4
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4
 
       - name: Build flyline library and extract help text
-        uses: docker/bake-action@v7
+        uses: docker/bake-action@d3418bd7d0e9324001bca92fa8ba175ea7e6dc9b # v7
         with:
           files: docker-bake.hcl
           targets: extract-help-text
@@ -87,18 +88,29 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          set -euo pipefail
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git checkout -B update-settings-docs
           git add README.md
-          git diff --cached --quiet && echo "No changes to settings docs" && exit 0
+          if git diff --cached --quiet; then
+            echo "No changes to settings docs"
+            exit 0
+          fi
           git commit -m "chore: update settings documentation from flyline --help"
           git push --force origin update-settings-docs
-          gh pr create \
-            --title "chore: update settings documentation" \
-            --body "Automated PR to update the Settings section of the README from \`flyline --help\`." \
-            --base master \
-            --head update-settings-docs \
-          || gh pr edit update-settings-docs \
-            --title "chore: update settings documentation" \
-            --body "Automated PR to update the Settings section of the README from \`flyline --help\`."
+
+          title="chore: update settings documentation"
+          body="Automated PR to update the Settings section of the README from \`flyline --help\`."
+
+          # Open the PR, or update it if one already exists for this branch.
+          if gh pr create --title "$title" --body "$body" --base master --head update-settings-docs; then
+            echo "Opened pull request."
+          elif gh pr edit update-settings-docs --title "$title" --body "$body"; then
+            echo "Updated existing pull request."
+          else
+            echo "::error::Failed to create or update the pull request for branch 'update-settings-docs'."
+            echo "::error::This usually means repository/organization policy disallows GitHub Actions from creating pull requests."
+            echo "::error::Enable 'Allow GitHub Actions to create and approve pull requests' under Settings > Actions > General (Workflow permissions), then re-run this workflow. The branch has already been pushed, so a PR can also be opened manually."
+            exit 1
+          fi

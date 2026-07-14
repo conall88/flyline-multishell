@@ -1,0 +1,4 @@
+# Placeholder so `COPY docker/build-release-assets/` resolves in the install-test
+# Dockerfiles even before the `build-release-assets` Bake target has produced
+# local release assets here. Populated (and overwritten) by:
+#   docker buildx bake -f docker-bake.hcl build-release-assets

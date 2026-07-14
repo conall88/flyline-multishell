@@ -1,6 +1,41 @@
 use libc::{c_char, c_int};
 use std::sync::Mutex;
 
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
+unsafe extern "C" {
+    fn mi_malloc(size: usize) -> *mut std::ffi::c_void;
+    fn mi_free(ptr: *mut std::ffi::c_void);
+    fn mi_realloc(ptr: *mut std::ffi::c_void, newsize: usize) -> *mut std::ffi::c_void;
+    fn mi_zalloc(size: usize) -> *mut std::ffi::c_void;
+    fn mi_malloc_aligned(size: usize, alignment: usize) -> *mut std::ffi::c_void;
+    fn mi_realloc_aligned(
+        ptr: *mut std::ffi::c_void,
+        newsize: usize,
+        alignment: usize,
+    ) -> *mut std::ffi::c_void;
+    fn mi_zalloc_aligned(size: usize, alignment: usize) -> *mut std::ffi::c_void;
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn flyline_dummy_allocator_keep_alive() {
+    unsafe {
+        let mut ptr1 = mi_malloc(1);
+        let ptr2 = mi_zalloc(1);
+        let mut ptr3 = mi_malloc_aligned(1, 8);
+        let ptr4 = mi_zalloc_aligned(1, 8);
+
+        ptr1 = mi_realloc(ptr1, 2);
+        ptr3 = mi_realloc_aligned(ptr3, 2, 8);
+
+        mi_free(ptr1);
+        mi_free(ptr2);
+        mi_free(ptr3);
+        mi_free(ptr4);
+    }
+}
+
 pub const FILENAME_INFERENCE_LIMIT: usize = 5000;
 
 #[cfg(feature = "pre_bash_4_4")]
@@ -12,6 +47,8 @@ mod active_suggestions;
 mod agent_mode;
 mod app;
 mod bash_funcs;
+#[cfg(feature = "standalone")]
+mod bash_stubs;
 mod bash_symbols;
 mod changelog;
 mod cli;
@@ -20,6 +57,7 @@ mod content_builder;
 mod content_utils;
 mod cursor;
 mod dparser;
+mod flycomp_options;
 mod globbing;
 mod history;
 pub mod hostnames;
@@ -30,6 +68,7 @@ mod mouse_state;
 mod palette;
 mod prompt_manager;
 mod settings;
+mod shell;
 mod shell_integration;
 mod snake_animation;
 mod stateful_sliding_window;
@@ -40,6 +79,22 @@ pub(crate) mod threads;
 mod tutorial;
 pub mod unicode_helpers;
 mod users;
+
+#[cfg(feature = "standalone")]
+pub use app::{ExitState, get_command};
+#[cfg(feature = "standalone")]
+pub use cli::run_flyline_command;
+#[cfg(feature = "standalone")]
+pub use settings::Settings;
+#[cfg(feature = "standalone")]
+pub use shell::zsh::{StandaloneTerminalGuard, ZSH_BACKEND, run_comp_broker, set_cloexec};
+#[cfg(feature = "standalone")]
+pub use shell::{backend, is_zsh_host_env, set_backend};
+
+#[cfg(feature = "standalone")]
+pub fn init_standalone_logging() -> anyhow::Result<()> {
+    logging::init()
+}
 
 // Global state for our custom input stream
 static FLYLINE_INSTANCE_PTR: Mutex<Option<Box<Flyline>>> = Mutex::new(None);
@@ -72,7 +127,7 @@ extern "C" fn flyline_get_char() -> c_int {
             Err(_) => {
                 // writing to stderr can panic if master pty side has been closed.
                 report_stderr_no_panic(
-                    "flyline: app panicked; recovering with EOF. Please create an issue with the steps to reproduce at https://github.com/HalFrgrd/flyline/issues.",
+                    "flyline: app panicked; recovering with EOF. Please create an issue with the steps to reproduce at https://github.com/conall88/flyline-multishell/issues.",
                 );
                 report_error_no_panic("app panicked; recovering with EOF");
 
@@ -197,16 +252,7 @@ impl Flyline {
 
             self.content = match result {
                 app::ExitState::WithCommand(cmd) => {
-                    if self.settings.tutorial_step.is_active() && cmd.trim().is_empty() {
-                        self.settings.tutorial_step.next();
-                        log::info!(
-                            "Tutorial step advanced to {:?}",
-                            self.settings.tutorial_step
-                        );
-                        if !self.settings.tutorial_step.is_active() {
-                            self.settings.run_tutorial = false;
-                        }
-                    }
+                    self.settings.advance_tutorial_on_submit(&cmd);
                     cmd.into_bytes()
                 }
                 app::ExitState::EOF => {

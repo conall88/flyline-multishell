@@ -1,137 +1,676 @@
 name: Release
 
+# Release pipeline for the `flyline-multishell` fork.
+#
+# Triggers:
+#   * push of a `multishell-v*.*.*` tag  -> real release (dry_run=false)
+#   * workflow_dispatch                  -> non-publishing dry run only.
+#
+# This workflow NEVER creates or pushes git tags. Real releases reuse the tag
+# that already exists on the remote (created by a human per RELEASE-CHECKLIST.md).
+#
+# Draft-first, test-before-publish flow:
+#   setup -> build (12-target matrix) + sbom -> test-install
+#         -> attest -> upload validated assets -> publish
+#         -> prepare-release (real runs only; joins before upload)
+#
+# Dry-run performs everything except creating/editing a GitHub release: it still
+# builds, packages, produces checksums + SBOM, uploads Actions artifacts, and
+# runs the installer test matrix so a release can be rehearsed safely.
+
 on:
   push:
     tags:
-      - 'v*.*.*'
+      - 'multishell-v*.*.*'
   workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing tag/ref to release (e.g. multishell-v1.0.0). Leave empty for a dry-run rehearsal derived from Cargo.toml.'
+        required: false
+        type: string
+      dry_run:
+        description: 'Must remain enabled. Manual dispatches never create or edit releases.'
+        required: false
+        type: boolean
+        default: true
 
+# One in-flight release per tag; do not cancel a release that is already running.
+concurrency:
+  group: release-${{ github.event.inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+# Least privilege by default; individual jobs elevate only what they need.
 permissions:
-  contents: write
+  contents: read
+
+defaults:
+  run:
+    shell: bash
 
 jobs:
-  create-release:
-    name: create-release
+  # ---------------------------------------------------------------------------
+  # Derive and validate all release metadata once, share via job outputs.
+  # ---------------------------------------------------------------------------
+  setup:
+    name: setup
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      tag: ${{ steps.meta.outputs.tag }}
+      version: ${{ steps.meta.outputs.version }}
+      dry_run: ${{ steps.meta.outputs.dry_run }}
+      upstream_repo: ${{ steps.meta.outputs.upstream_repo }}
+      upstream_release: ${{ steps.meta.outputs.upstream_release }}
+      upstream_commit: ${{ steps.meta.outputs.upstream_commit }}
     steps:
-      - uses: actions/checkout@v7
-      - name: Get the release version from the tag
-        if: env.VERSION == ''
-        run: echo "VERSION=${{ github.ref_name }}" >> $GITHUB_ENV
-      - name: Show the version
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          ref: ${{ github.sha }}
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+        with:
+          toolchain: 1.96.0
+
+      - name: Derive and validate release metadata
+        id: meta
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_TAG: ${{ github.event.inputs.tag }}
+          INPUT_DRY_RUN: ${{ github.event.inputs.dry_run }}
+          REF_NAME: ${{ github.ref_name }}
         run: |
-          echo "version is: $VERSION"
-      - name: Check that tag version and Cargo.toml version are the same
-        shell: bash
-        run: |
-          if ! grep -q "version = \"${VERSION#v}\"" Cargo.toml; then
-            echo "version does not match Cargo.toml" >&2
+          set -euo pipefail
+
+          # Cargo package version is the source of truth for the release version.
+          cargo_version="$(cargo metadata --format-version 1 --no-deps \
+            | jq -r '.packages[] | select(.name == "flyline") | .version')"
+          if [ -z "$cargo_version" ] || [ "$cargo_version" = "null" ]; then
+            echo "::error::Could not read the 'flyline' package version from cargo metadata"
             exit 1
           fi
-      - name: Create GitHub release
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh release create "$VERSION" --draft --verify-tag --title "$VERSION"
-    outputs:
-      version: ${{ env.VERSION }}
 
-  build-release:
-    name: Build ${{ matrix.target }}${{ matrix.suffix }}
-    needs: create-release
+          # Resolve the release tag and mode from the trigger.
+          if [ "$EVENT_NAME" = "push" ]; then
+            tag="$REF_NAME"
+            dry_run="false"
+          else
+            if [ "${INPUT_DRY_RUN:-true}" != "true" ]; then
+              echo "::error::Manual publishing is disabled. Push an immutable multishell-vX.Y.Z tag to create a release."
+              exit 1
+            fi
+            if [ -n "${INPUT_TAG:-}" ]; then
+              tag="$INPUT_TAG"
+            else
+              # No tag supplied: rehearse against a synthetic tag from Cargo.toml.
+              tag="multishell-v${cargo_version}"
+            fi
+            dry_run="true"
+          fi
+
+          # Validate the tag prefix.
+          case "$tag" in
+            multishell-v*) : ;;
+            *)
+              echo "::error::Release tag '$tag' must start with 'multishell-v'"
+              exit 1
+              ;;
+          esac
+
+          tag_version="${tag#multishell-v}"
+
+          # Validate a strict, release-grade X.Y.Z shape (no extra components,
+          # suffixes, or leading zeroes).
+          if ! [[ "$tag_version" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo "::error::Version '$tag_version' (from tag '$tag') is not strict X.Y.Z SemVer"
+            exit 1
+          fi
+
+          # Tag version must match the Cargo package version exactly.
+          if [ "$tag_version" != "$cargo_version" ]; then
+            echo "::error::Tag version '$tag_version' does not match Cargo package version '$cargo_version'"
+            exit 1
+          fi
+
+          # Read upstream base metadata (records the upstream point this fork tracks).
+          ub="UPSTREAM_BASE.toml"
+          if [ ! -f "$ub" ]; then
+            echo "::error::$ub not found; it records the upstream release/commit this fork is based on"
+            exit 1
+          fi
+          read_toml() {
+            # Extract a bare/quoted string value for a top-level `key = "value"`.
+            grep -E "^[[:space:]]*$1[[:space:]]*=" "$ub" | head -1 \
+              | sed -E 's/^[^=]*=[[:space:]]*"?([^"#]*)"?[[:space:]]*(#.*)?$/\1/' \
+              | sed -E 's/[[:space:]]+$//'
+          }
+          upstream_repo="$(read_toml repository)"
+          upstream_release="$(read_toml release)"
+          upstream_commit="$(read_toml commit)"
+          if [ -z "$upstream_repo" ] || [ -z "$upstream_release" ] || [ -z "$upstream_commit" ]; then
+            echo "::error::$ub must define [upstream] repository, release and commit"
+            exit 1
+          fi
+
+          {
+            echo "tag=$tag"
+            echo "version=$tag_version"
+            echo "dry_run=$dry_run"
+            echo "upstream_repo=$upstream_repo"
+            echo "upstream_release=$upstream_release"
+            echo "upstream_commit=$upstream_commit"
+          } >> "$GITHUB_OUTPUT"
+
+          {
+            echo "### Release metadata"
+            echo ""
+            echo "| field | value |"
+            echo "| --- | --- |"
+            echo "| repository | \`${GITHUB_REPOSITORY}\` |"
+            echo "| tag | \`$tag\` |"
+            echo "| version | \`$tag_version\` |"
+            echo "| dry run | \`$dry_run\` |"
+            echo "| upstream repo | \`$upstream_repo\` |"
+            echo "| upstream release | \`$upstream_release\` |"
+            echo "| upstream commit | \`$upstream_commit\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ---------------------------------------------------------------------------
+  # Create (or idempotently reuse) the draft release for a real run. The entire
+  # write-capable job is skipped in dry-run mode.
+  # ---------------------------------------------------------------------------
+  prepare-release:
+    name: prepare-release
+    needs: setup
+    if: needs.setup.outputs.dry_run == 'false'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Create or reuse draft release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.setup.outputs.tag }}
+          REPO: ${{ github.repository }}
+          UPSTREAM_RELEASE: ${{ needs.setup.outputs.upstream_release }}
+          UPSTREAM_COMMIT: ${{ needs.setup.outputs.upstream_commit }}
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
+            is_draft="$(gh release view "$TAG" --repo "$REPO" --json isDraft --jq .isDraft)"
+            if [ "$is_draft" != "true" ]; then
+              echo "::error::Release '$TAG' is already published; refusing to replace its assets or change its release state"
+              exit 1
+            fi
+            echo "Reusing existing draft release '$TAG' in $REPO"
+          else
+            # --verify-tag guarantees we never create/push a tag: the tag must
+            # already exist on the remote or this fails.
+            gh release create "$TAG" \
+              --repo "$REPO" \
+              --draft \
+              --verify-tag \
+              --title "flyline-multishell $TAG (upstream ${UPSTREAM_RELEASE}@${UPSTREAM_COMMIT})" \
+              --notes "Draft release in progress — assets are still uploading."
+            echo "Created draft release '$TAG' in $REPO"
+          fi
+
+  # ---------------------------------------------------------------------------
+  # Build the loadable library + standalone binary for every target, package a
+  # release archive, checksum it, and upload it as an Actions artifact. The
+  # write-capable upload job consumes these only after tests pass.
+  # ---------------------------------------------------------------------------
+  build:
+    name: build ${{ matrix.target }}${{ matrix.suffix }}
+    needs: setup
     runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
     strategy:
       fail-fast: false
       matrix:
         include:
           # Linux (via cross)
-          - { target: x86_64-unknown-linux-gnu,   os: ubuntu-latest, build_tool: cross, lib: libflyline.so,    feature_flags: "",                        suffix: "" }
-          - { target: x86_64-unknown-linux-musl,  os: ubuntu-latest, build_tool: cross, lib: libflyline.so,    feature_flags: "",                        suffix: "" }
-          - { target: aarch64-unknown-linux-gnu,  os: ubuntu-latest, build_tool: cross, lib: libflyline.so,    feature_flags: "",                        suffix: "" }
-          - { target: aarch64-unknown-linux-musl, os: ubuntu-latest, build_tool: cross, lib: libflyline.so,    feature_flags: "",                        suffix: "" }
+          - { target: x86_64-unknown-linux-gnu,       os: ubuntu-latest, build_tool: cross, lib: libflyline.so,    feature_flags: "",                        suffix: "" }
+          - { target: x86_64-unknown-linux-musl,      os: ubuntu-latest, build_tool: cross, lib: libflyline.so,    feature_flags: "",                        suffix: "" }
+          - { target: aarch64-unknown-linux-gnu,      os: ubuntu-latest, build_tool: cross, lib: libflyline.so,    feature_flags: "",                        suffix: "" }
+          - { target: aarch64-unknown-linux-musl,     os: ubuntu-latest, build_tool: cross, lib: libflyline.so,    feature_flags: "",                        suffix: "" }
           # Additional Linux architectures
           - { target: armv7-unknown-linux-gnueabihf,  os: ubuntu-latest, build_tool: cross, lib: libflyline.so,    feature_flags: "",                        suffix: "" }
           - { target: i686-unknown-linux-gnu,         os: ubuntu-latest, build_tool: cross, lib: libflyline.so,    feature_flags: "",                        suffix: "" }
           - { target: riscv64gc-unknown-linux-gnu,    os: ubuntu-latest, build_tool: cross, lib: libflyline.so,    feature_flags: "",                        suffix: "" }
           - { target: powerpc64le-unknown-linux-gnu,  os: ubuntu-latest, build_tool: cross, lib: libflyline.so,    feature_flags: "",                        suffix: "" }
           # Linux pre_bash_4_4
-          - { target: x86_64-unknown-linux-gnu,   os: ubuntu-latest, build_tool: cross, lib: libflyline.so,    feature_flags: "--features pre_bash_4_4", suffix: "_pre_bash_4_4" }
+          - { target: x86_64-unknown-linux-gnu,       os: ubuntu-latest, build_tool: cross, lib: libflyline.so,    feature_flags: "--features pre_bash_4_4", suffix: "_pre_bash_4_4" }
           # FreeBSD (via cross)
-          - { target: x86_64-unknown-freebsd,     os: ubuntu-latest, build_tool: cross, lib: libflyline.so,    feature_flags: "",                        suffix: "" }
+          - { target: x86_64-unknown-freebsd,         os: ubuntu-latest, build_tool: cross, lib: libflyline.so,    feature_flags: "",                        suffix: "" }
           # macOS (native cargo)
-          - { target: x86_64-apple-darwin,        os: macos-latest,  build_tool: cargo, lib: libflyline.dylib, feature_flags: "",                        suffix: "" }
-          - { target: aarch64-apple-darwin,       os: macos-latest,  build_tool: cargo, lib: libflyline.dylib, feature_flags: "",                        suffix: "" }
+          - { target: x86_64-apple-darwin,            os: macos-latest,  build_tool: cargo, lib: libflyline.dylib, feature_flags: "",                        suffix: "" }
+          - { target: aarch64-apple-darwin,           os: macos-latest,  build_tool: cargo, lib: libflyline.dylib, feature_flags: "",                        suffix: "" }
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          ref: ${{ needs.setup.outputs.dry_run == 'false' && needs.setup.outputs.tag || github.sha }}
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
         with:
+          toolchain: 1.96.0
           targets: ${{ matrix.target }}
 
       - name: Install cross
         if: matrix.build_tool == 'cross'
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@2ca9b94c269419b7b0c711c09d0b21c4e1d51145 # v2
         with:
-          tool: cross
+          tool: cross@0.2.5
 
-      - name: Build ${{ matrix.target }}${{ matrix.suffix }}
-        run: ${{ matrix.build_tool }} build --release --target ${{ matrix.target }} ${{ matrix.feature_flags }}
-
-      - name: Prepare release artifact
+      # Standalone binary (zsh host) — requires the `standalone` feature, plus
+      # any per-target feature flags (e.g. pre_bash_4_4) combined in.
+      - name: Build standalone binary
         run: |
-          ARCHIVE="libflyline-${{ github.ref_name }}-${{ matrix.target }}${{ matrix.suffix }}"
-          echo "ARCHIVE=$ARCHIVE" >> $GITHUB_ENV
+          ${{ matrix.build_tool }} build --release \
+            --target ${{ matrix.target }} ${{ matrix.feature_flags }} \
+            --features standalone --bin flyline-standalone
 
-      - name: Build archive
-        shell: bash
+      # Loadable Bash builtin library.
+      - name: Build loadable library
         run: |
-          version="${{ needs.create-release.outputs.version }}"
-          version_no_v="${version#v}"
-          lib_versioned="${{ matrix.lib }}.$version_no_v"
-          cp "target/${{ matrix.target }}/release/${{ matrix.lib }}" "target/${{ matrix.target }}/release/$lib_versioned"
-          tar czf "$ARCHIVE.tar.gz" -C "target/${{ matrix.target }}/release" "$lib_versioned"
-          shasum -a 256 "$ARCHIVE.tar.gz" > "$ARCHIVE.tar.gz.sha256"
-          echo "ASSET=$ARCHIVE.tar.gz" >> $GITHUB_ENV
-          echo "ASSET_SUM=$ARCHIVE.tar.gz.sha256" >> $GITHUB_ENV
+          ${{ matrix.build_tool }} build --release \
+            --target ${{ matrix.target }} ${{ matrix.feature_flags }}
 
-      - name: Upload release archive
+      - name: Package release archive
+        id: package
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        shell: bash
+          TAG: ${{ needs.setup.outputs.tag }}
+          VERSION: ${{ needs.setup.outputs.version }}
+          TARGET: ${{ matrix.target }}
+          SUFFIX: ${{ matrix.suffix }}
+          LIB: ${{ matrix.lib }}
         run: |
-          version="${{ needs.create-release.outputs.version }}"
-          gh release upload "$version" ${{ env.ASSET }} ${{ env.ASSET_SUM }}
+          set -euo pipefail
+          rel_dir="target/${TARGET}/release"
+          lib_versioned="${LIB}.${VERSION}"
 
-  publish-release:
-    name: publish-release
-    needs: [create-release, build-release]
+          stage="$(mktemp -d)"
+          mkdir -p "$stage/scripts"
+
+          # Versioned loadable library (install.sh symlinks libflyline.<ext> -> this).
+          cp "$rel_dir/${LIB}" "$stage/${lib_versioned}"
+          # Standalone editor binary (zsh host).
+          cp "$rel_dir/flyline-standalone" "$stage/flyline-standalone"
+          # Shell integration + licences + upstream provenance.
+          cp scripts/flyline.zsh "$stage/scripts/flyline.zsh"
+          cp LICENSE-MIT LICENSE-GPLv3 UPSTREAM_BASE.toml "$stage/"
+
+          archive="libflyline-${TAG}-${TARGET}${SUFFIX}.tar.gz"
+          tar czf "$archive" -C "$stage" .
+          shasum -a 256 "$archive" > "${archive}.sha256"
+
+          echo "archive=$archive" >> "$GITHUB_OUTPUT"
+          echo "checksum=${archive}.sha256" >> "$GITHUB_OUTPUT"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: release-asset-${{ matrix.target }}${{ matrix.suffix }}
+          path: |
+            ${{ steps.package.outputs.archive }}
+            ${{ steps.package.outputs.checksum }}
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # Software Bill of Materials (SPDX JSON) for the source + dependency tree.
+  # Uploaded as an Actions artifact in both modes; the release upload happens
+  # only after the installation matrix passes.
+  # ---------------------------------------------------------------------------
+  sbom:
+    name: sbom
+    needs: setup
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
-      - name: Upload install.sh to release
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          gh release upload "${{ needs.create-release.outputs.version }}" install.sh --clobber
-      - name: Mark release as prerelease
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          gh release edit "${{ needs.create-release.outputs.version }}" --prerelease --draft=false --repo HalFrgrd/flyline
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          ref: ${{ needs.setup.outputs.dry_run == 'false' && needs.setup.outputs.tag || github.sha }}
 
-  test-installation:
-    name: test-installation
-    needs: [create-release, publish-release]
-    runs-on: ubuntu-latest
+      - name: Generate SBOM (SPDX JSON) with Syft
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0
+        with:
+          path: .
+          format: spdx-json
+          output-file: flyline-multishell-${{ needs.setup.outputs.tag }}-sbom.spdx.json
+          # We manage uploads ourselves for consistent naming across both modes.
+          upload-artifact: false
+          upload-release-assets: false
+
+      - name: Upload SBOM artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: release-sbom
+          path: flyline-multishell-${{ needs.setup.outputs.tag }}-sbom.spdx.json
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # Installer test matrix. Runs BEFORE publication in BOTH modes: assembles all
+  # built assets into the release-assets/ layout, serves them locally, and drives
+  # the docker buildx bake installer targets against that local source.
+  #
+  # Contract with the installer Dockerfiles (owned by the installer agent):
+  #   * release-assets/ layout served at the root of a static HTTP server:
+  #         release-assets/<tag>/install.sh
+  #         release-assets/<tag>/scripts/flyline.zsh
+  #         release-assets/<tag>/libflyline-<tag>-<target>[<suffix>].tar.gz
+  #         release-assets/<tag>/libflyline-<tag>-<target>[<suffix>].tar.gz.sha256
+  #         release-assets/<tag>/flyline-multishell-<tag>-sbom.spdx.json
+  #   * Bake args passed to every installer target:
+  #         FLYLINE_INSTALL_VERSION = <tag>
+  #         FLYLINE_ASSET_BASE      = http://<host>:<port>/<tag>
+  #     Dockerfiles/install.sh must fetch install.sh and archives from
+  #         ${FLYLINE_ASSET_BASE}/<asset>
+  #     falling back to the public GitHub release URL when FLYLINE_ASSET_BASE
+  #     is unset (default behaviour for end users).
+  # ---------------------------------------------------------------------------
+  test-install:
+    name: test-install (${{ matrix.label }})
+    needs: [setup, build, sbom]
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        # Validate the distro/Bash matrix on x86_64 and exercise the published
+        # aarch64 GNU archive natively on GitHub's ARM64 hosted runners.
+        include:
+          - { target: install-test-alpine,        runner: ubuntu-latest,   label: alpine-x86_64 }
+          - { target: install-test-ubuntu,        runner: ubuntu-latest,   label: ubuntu-x86_64 }
+          - { target: install-test-arch,          runner: ubuntu-latest,   label: arch-x86_64 }
+          - { target: install-test-bash-3-2-57,   runner: ubuntu-latest,   label: bash-3.2-x86_64 }
+          - { target: install-test-release-zsh,   runner: ubuntu-latest,   label: zsh-x86_64 }
+          - { target: install-test-ubuntu,        runner: ubuntu-24.04-arm, label: ubuntu-arm64 }
+          - { target: install-test-release-zsh,   runner: ubuntu-24.04-arm, label: zsh-arm64 }
     steps:
-      - uses: actions/checkout@v7
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v4
-      - name: Test installation on Alpine and Ubuntu
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          ref: ${{ needs.setup.outputs.dry_run == 'false' && needs.setup.outputs.tag || github.sha }}
+
+      - name: Download built release assets
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          pattern: release-asset-*
+          path: downloaded-assets
+          merge-multiple: true
+
+      - name: Download SBOM
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          name: release-sbom
+          path: downloaded-assets
+
+      - name: Assemble release-assets/ layout
         env:
-          FLYLINE_INSTALL_VERSION: ${{ needs.create-release.outputs.version }}
+          TAG: ${{ needs.setup.outputs.tag }}
         run: |
-          docker buildx bake -f docker-bake.hcl install-test-alpine install-test-ubuntu install-test-bash-3-2-57
+          set -euo pipefail
+          dest="release-assets/${TAG}"
+          mkdir -p "$dest/scripts"
+          cp install.sh "$dest/install.sh"
+          cp scripts/flyline.zsh "$dest/scripts/flyline.zsh"
+          # Archives, checksums and SBOM flattened from the downloaded artifacts.
+          find downloaded-assets -type f \( -name '*.tar.gz' -o -name '*.sha256' -o -name '*.spdx.json' \) \
+            -exec cp {} "$dest/" \;
+          echo "Assembled release-assets for $TAG:"
+          ls -1 "$dest"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4
+
+      - name: Serve release assets locally
+        env:
+          TAG: ${{ needs.setup.outputs.tag }}
+        run: |
+          set -euo pipefail
+          # Static file server for the release-assets/ tree.
+          nohup python3 -m http.server 8080 --directory release-assets --bind 0.0.0.0 \
+            > httpserver.log 2>&1 &
+          echo $! > httpserver.pid
+          # Wait until install.sh is reachable from the runner.
+          for _ in $(seq 1 15); do
+            if curl -sfo /dev/null "http://127.0.0.1:8080/${TAG}/install.sh"; then
+              break
+            fi
+            sleep 1
+          done
+          curl -sfo /dev/null "http://127.0.0.1:8080/${TAG}/install.sh" \
+            || { echo "::error::Local asset server did not come up"; cat httpserver.log; exit 1; }
+
+          # Reachable address for docker build containers (default bridge gateway).
+          gw="$(docker network inspect bridge -f '{{range .IPAM.Config}}{{.Gateway}}{{end}}' 2>/dev/null || true)"
+          [ -n "$gw" ] || gw="172.17.0.1"
+          echo "FLYLINE_ASSET_BASE=http://${gw}:8080/${TAG}" >> "$GITHUB_ENV"
+
+      - name: Run installer test
+        env:
+          FLYLINE_INSTALL_VERSION: ${{ needs.setup.outputs.tag }}
+        run: |
+          set -euo pipefail
+          echo "Testing ${{ matrix.target }} against ${FLYLINE_ASSET_BASE}/${FLYLINE_INSTALL_VERSION}"
+          docker buildx bake -f docker-bake.hcl "${{ matrix.target }}" \
+            --set "*.args.FLYLINE_INSTALL_VERSION=${FLYLINE_INSTALL_VERSION}" \
+            --set "*.args.FLYLINE_ASSET_BASE=${FLYLINE_ASSET_BASE}"
+
+      - name: Stop asset server
+        if: always()
+        run: |
+          [ -f httpserver.pid ] && kill "$(cat httpserver.pid)" 2>/dev/null || true
+
+  # ---------------------------------------------------------------------------
+  # Build provenance attestation for the release archives (real mode only).
+  # Uses GitHub's OIDC-backed attestations — no custom signing secret required.
+  # ---------------------------------------------------------------------------
+  attest:
+    name: attest
+    needs: [setup, build, test-install]
+    if: needs.setup.outputs.dry_run == 'false'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - name: Download built release assets
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          pattern: release-asset-*
+          path: downloaded-assets
+          merge-multiple: true
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3
+        with:
+          subject-path: 'downloaded-assets/*.tar.gz'
+
+  # ---------------------------------------------------------------------------
+  # Upload only after all installation tests and provenance generation pass.
+  # This is the sole asset-upload job, so build/SBOM dry runs stay read-only.
+  # ---------------------------------------------------------------------------
+  upload-release-assets:
+    name: upload release assets
+    needs: [setup, prepare-release, build, sbom, test-install, attest]
+    if: needs.setup.outputs.dry_run == 'false'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout tagged installer
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          ref: ${{ needs.setup.outputs.tag }}
+
+      - name: Download archives, checksums, and SBOM
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          pattern: release-*
+          path: release-assets
+          merge-multiple: true
+
+      - name: Upload validated assets to draft
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.setup.outputs.tag }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          is_draft="$(gh release view "$TAG" --repo "$REPO" --json isDraft --jq .isDraft)"
+          if [ "$is_draft" != "true" ]; then
+            echo "::error::Release '$TAG' is no longer a draft; refusing to overwrite published assets"
+            exit 1
+          fi
+          gh release upload "$TAG" install.sh ./release-assets/* \
+            --repo "$REPO" \
+            --clobber
+
+  # ---------------------------------------------------------------------------
+  # Publish: flip the draft to a prerelease with generated notes + a body/title
+  # identifying the flyline-multishell version and the exact upstream base.
+  # Real mode only, and only after the full test matrix has passed.
+  # Stable promotion (removing --prerelease) remains a manual step.
+  # ---------------------------------------------------------------------------
+  publish:
+    name: publish
+    needs: [setup, upload-release-assets]
+    if: needs.setup.outputs.dry_run == 'false'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          ref: ${{ needs.setup.outputs.dry_run == 'false' && needs.setup.outputs.tag || github.sha }}
+
+      - name: Compose release notes
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.setup.outputs.tag }}
+          VERSION: ${{ needs.setup.outputs.version }}
+          REPO: ${{ github.repository }}
+          UPSTREAM_REPO: ${{ needs.setup.outputs.upstream_repo }}
+          UPSTREAM_RELEASE: ${{ needs.setup.outputs.upstream_release }}
+          UPSTREAM_COMMIT: ${{ needs.setup.outputs.upstream_commit }}
+        run: |
+          set -euo pipefail
+
+          # The embedded changelog is the source of truth for user-facing
+          # changes. GitHub's generated notes omit direct-to-master commits, so
+          # require and include the section for this exact fork version.
+          changelog="$(awk -v "heading=## v${VERSION}" '
+            $0 == heading { capture = 1; next }
+            capture && /^## / { exit }
+            capture { print }
+          ' src/changelog.rs)"
+          if [ -z "$changelog" ]; then
+            echo "::error::src/changelog.rs has no '## v${VERSION}' section"
+            exit 1
+          fi
+
+          # Generate a changelog only against the previous product release.
+          # Documentation assets use their own `assets` release/tag and must
+          # never become the comparison base for a multishell release.
+          previous_tag=""
+          while IFS= read -r candidate; do
+            case "$candidate" in
+              multishell-v*)
+                if [ "$candidate" != "$TAG" ]; then
+                  previous_tag="$candidate"
+                  break
+                fi
+                ;;
+            esac
+          done <<EOF
+          $(gh release list --repo "$REPO" --limit 100 --json tagName,isDraft \
+            --jq '.[] | select(.isDraft == false) | .tagName')
+          EOF
+
+          generated=""
+          if [ -n "$previous_tag" ]; then
+            generated="$(gh api "repos/${REPO}/releases/generate-notes" \
+              -f tag_name="$TAG" \
+              -f previous_tag_name="$previous_tag" \
+              -q '.body' 2>/dev/null || true)"
+          fi
+
+          {
+            echo "## flyline-multishell $TAG"
+            echo ""
+            echo "Multishell fork of flyline (\`${VERSION}\`). This release bundles the Bash"
+            echo "loadable builtin **and** the standalone \`flyline-standalone\` binary used by"
+            echo "the zsh integration, for every supported target."
+            echo ""
+            echo "## Changelog"
+            echo ""
+            echo "$changelog"
+            echo ""
+            echo "**Upstream base**"
+            echo ""
+            echo "- Repository: \`${UPSTREAM_REPO}\`"
+            echo "- Release: \`${UPSTREAM_RELEASE}\`"
+            echo "- Commit: \`${UPSTREAM_COMMIT}\`"
+            echo ""
+            if [ -n "$generated" ]; then
+              echo "---"
+              echo ""
+              echo "$generated"
+            fi
+          } > release-body.md
+
+      - name: Publish draft as prerelease
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.setup.outputs.tag }}
+          REPO: ${{ github.repository }}
+          UPSTREAM_RELEASE: ${{ needs.setup.outputs.upstream_release }}
+          UPSTREAM_COMMIT: ${{ needs.setup.outputs.upstream_commit }}
+        run: |
+          set -euo pipefail
+          is_draft="$(gh release view "$TAG" --repo "$REPO" --json isDraft --jq .isDraft)"
+          if [ "$is_draft" != "true" ]; then
+            echo "::error::Release '$TAG' is no longer a draft; refusing to change a published release"
+            exit 1
+          fi
+          gh release edit "$TAG" \
+            --repo "$REPO" \
+            --title "flyline-multishell $TAG (upstream ${UPSTREAM_RELEASE}@${UPSTREAM_COMMIT})" \
+            --notes-file release-body.md \
+            --verify-tag \
+            --draft=false \
+            --prerelease
+          echo "Published prerelease '$TAG' in $REPO"
+
+      - name: Publish summary + rerun/cleanup guidance
+        env:
+          TAG: ${{ needs.setup.outputs.tag }}
+          REPO: ${{ github.repository }}
+        run: |
+          {
+            echo "### Published prerelease \`$TAG\`"
+            echo ""
+            echo "- Repository: \`$REPO\`"
+            echo "- Marked as **prerelease**. Promote to stable manually once verified:"
+            echo "  \`gh release edit $TAG --repo $REPO --prerelease=false --latest\`"
+            echo ""
+            echo "#### Rerun / cleanup guidance"
+            echo ""
+            echo "- Reruns are safe while the release remains a draft: assets are re-uploaded with \`--clobber\`, and no tags are ever created."
+            echo "- To discard a botched release WITHOUT deleting the git tag:"
+            echo "  \`gh release delete $TAG --repo $REPO --yes\`"
+            echo "  (Do NOT pass \`--cleanup-tag\`; the tag is managed by humans per RELEASE-CHECKLIST.md.)"
+            echo "- Retry the same tag only for transient failures. Source fixes require a new version and immutable tag."
+          } >> "$GITHUB_STEP_SUMMARY"

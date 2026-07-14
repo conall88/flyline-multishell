@@ -1,7 +1,7 @@
 # Base image for demo generation
 
 # Use a recent Ubuntu base image
-FROM ubuntu:24.04 AS demo-base
+FROM ubuntu:24.04@sha256:4fbb8e6a8395de5a7550b33509421a2bafbc0aab6c06ba2cef9ebffbc7092d90 AS demo-base
 
 # Create a non-root user for demos
 RUN useradd -m -s /bin/bash john
@@ -27,10 +27,26 @@ USER john
 # Ensure build-time RUN steps (non-interactive shells) can resolve demo helper binaries.
 ENV PATH="/home/john/bin:${PATH}"
 
-ENV EVP_VERSION=v0.17.0
+# Install a pinned EVP release (the terminal recorder used to render the demos).
+# Pinning an exact version and verifying the published SHA-256 avoids the
+# supply-chain risk of piping the raw/master install script straight into sh.
+ENV EVP_VERSION=0.17.0
+ENV EVP_TARGET=x86_64-unknown-linux-musl
+ENV EVP_SHA256=295a0b250b6cd04fe294cedee20dbf392df012d962f3cc37d3085b4cd1daeaaa
 ENV EVP_INSTALL_DIR=/home/john/bin
-RUN sh -c '/usr/bin/curl -sSfL https://raw.githubusercontent.com/HalFrgrd/evp/master/install.sh | sh'
-# COPY ./evp /home/john/bin/
+RUN set -eu; \
+    asset="evp-${EVP_VERSION}-${EVP_TARGET}.tar.gz"; \
+    base_url="https://github.com/HalFrgrd/evp/releases/download/v${EVP_VERSION}"; \
+    mkdir -p "${EVP_INSTALL_DIR}"; \
+    tmp="$(mktemp -d)"; \
+    curl --fail --location --show-error --silent \
+        --retry 5 --retry-delay 2 --retry-connrefused \
+        -o "${tmp}/${asset}" "${base_url}/${asset}"; \
+    echo "${EVP_SHA256}  ${tmp}/${asset}" | sha256sum -c -; \
+    tar -xzf "${tmp}/${asset}" -C "${tmp}"; \
+    install -m 0755 "${tmp}/evp-${EVP_VERSION}-${EVP_TARGET}/evp" "${EVP_INSTALL_DIR}/evp"; \
+    rm -rf "${tmp}"; \
+    "${EVP_INSTALL_DIR}/evp" --version
 
 RUN touch /home/john/.bashrc && \
     printf '%s\n' \

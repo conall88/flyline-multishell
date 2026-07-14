@@ -6,7 +6,7 @@
 To install `flyline` for the first time, run the following command in your terminal:
 
 ```bash
-curl -sSfL https://github.com/HalFrgrd/flyline/releases/latest/download/install.sh | sh
+curl -sSfL https://github.com/conall88/flyline-multishell/releases/latest/download/install.sh | sh
 ```
 
 ### Arch Linux
@@ -34,13 +34,13 @@ paru -S flyline
 Upgrading `flyline` to the latest version uses the exact same script. You simply re-run the `curl` command:
 
 ```bash
-curl -sSfL https://github.com/HalFrgrd/flyline/releases/latest/download/install.sh | sh
+curl -sSfL https://github.com/conall88/flyline-multishell/releases/latest/download/install.sh | sh
 ```
 
 ### Upgrade Notification
 When `flyline` is already loaded in your shell, the environment variable `FLYLINE_VERSION` will be detected by the installer, which will print a summary of the version change:
 ```text
-==> Upgrade from v1.2.0 -> v1.2.1, run `flyline changelog` to see what's changed.
+==> Upgrade from multishell-v1.0.0 -> multishell-v1.0.1, run `flyline changelog` to see what's changed.
 ```
 
 If the resolved installation directory (`INSTALL_DIR`) differs from the active running load directory (`FLYLINE_LOAD_DIR`), the installer will print a warning:
@@ -75,10 +75,10 @@ You can customize the installation behavior by setting environment variables bef
 | `FLYLINE_INSTALL_VERSION` | Force the installer to download a specific version tag instead of the latest release. | *(latest release)* |
 
 ### Example Custom Installation
-To install version `v1.2.0` in a custom directory (`~/apps/lib`):
+To install version `multishell-v1.0.0` in a custom directory (`~/apps/lib`):
 
 ```bash
 export FLYLINE_INSTALL_DIR="~/apps/lib"
-export FLYLINE_INSTALL_VERSION="v1.2.0"
-curl -sSfL https://github.com/HalFrgrd/flyline/releases/latest/download/install.sh | sh
+export FLYLINE_INSTALL_VERSION="multishell-v1.0.0"
+curl -sSfL https://github.com/conall88/flyline-multishell/releases/latest/download/install.sh | sh
 ```

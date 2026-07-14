@@ -1,4 +1,4 @@
-FROM ubuntu:20.04 AS help-runner
+FROM ubuntu:20.04@sha256:8feb4d8ca5354def3d8fce243717141ce31e2c428701f6682bd2fafe15388214 AS help-runner
 
 # ubuntu:20.04 ships with bash 5.0; no extra install needed.
 # Prevent interactive prompts during any potential package installation

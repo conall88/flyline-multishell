@@ -89,16 +89,19 @@ static TEST_LOG_INIT: Once = Once::new();
 
 pub fn init() -> Result<()> {
     let logger = LOGGER.get_or_init(MemoryLogger::new);
-    match log::set_logger(logger) {
-        Ok(()) => {
-            log::set_max_level(LevelFilter::Trace);
-            Ok(())
-        }
-        Err(_) => {
-            log::set_max_level(LevelFilter::Trace);
-            Ok(())
-        }
+    let _ = log::set_logger(logger);
+    log::set_max_level(LevelFilter::Trace);
+
+    // Opt-in file sink. Per-prompt hosts (e.g. the standalone zsh editor) run a
+    // fresh process each prompt, so their in-memory logs vanish; pointing
+    // FLYLINE_LOG_FILE at a path appends every process's logs there for
+    // debugging (entries are pid-tagged). Harmless when unset.
+    if let Ok(path) = std::env::var("FLYLINE_LOG_FILE")
+        && !path.is_empty()
+    {
+        let _ = stream_logs(&path);
     }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -131,20 +134,6 @@ pub fn last_n_logs(n: usize) -> Vec<String> {
     } else {
         vec![]
     }
-}
-
-/// Dump all in-memory log entries to stdout.
-pub fn dump_logs_stdout() -> Result<()> {
-    let logger = LOGGER
-        .get()
-        .ok_or_else(|| anyhow!("Logger not initialized"))?;
-    let entries = logger.snapshot();
-    let stdout = std::io::stdout();
-    let mut out = stdout.lock();
-    for entry in entries {
-        writeln!(out, "{}", entry)?;
-    }
-    Ok(())
 }
 
 /// Clear all in-memory logs.
@@ -260,4 +249,67 @@ pub fn stream_logs(dest: &str) -> Result<()> {
     logger.set_stream_writer(writer);
 
     Ok(())
+}
+
+/// Retrieve all in-memory logs, optionally filtered to the last duration (e.g. "5s", "10m").
+pub fn get_filtered_logs(last_str: Option<&str>) -> Result<Vec<String>> {
+    let logger = LOGGER
+        .get()
+        .ok_or_else(|| anyhow!("Logger not initialized"))?;
+    let entries = logger.snapshot();
+
+    if let Some(last_str) = last_str {
+        let std_dur =
+            duration_str::parse(last_str).map_err(|e| anyhow!("Invalid duration: {}", e))?;
+        let chrono_dur =
+            chrono::Duration::from_std(std_dur).map_err(|e| anyhow!("Duration overflow: {}", e))?;
+
+        let now = chrono::Local::now().naive_local();
+        let cutoff = now - chrono_dur;
+
+        let filtered: Vec<String> = entries
+            .into_iter()
+            .filter(|entry| {
+                if let Some(first_word) = entry.split_whitespace().next() {
+                    if let Ok(dt) =
+                        chrono::NaiveDateTime::parse_from_str(first_word, "%Y-%m-%dT%H:%M:%S%.6f")
+                    {
+                        return dt >= cutoff;
+                    }
+                }
+                false
+            })
+            .collect();
+        Ok(filtered)
+    } else {
+        Ok(entries)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_log_filtering() {
+        let _ = init();
+        log_raw_entry(format!(
+            "{} [INFO] (pid=123) src/logging.rs:99: Test entry",
+            Local::now().format("%Y-%m-%dT%H:%M:%S%.6f")
+        ));
+
+        let logs = get_filtered_logs(Some("5s")).unwrap();
+        assert!(!logs.is_empty());
+        assert!(logs.iter().any(|l| l.contains("Test entry")));
+
+        let old_time = Local::now() - chrono::Duration::seconds(10);
+        log_raw_entry(format!(
+            "{} [INFO] (pid=123) src/logging.rs:99: Old entry",
+            old_time.format("%Y-%m-%dT%H:%M:%S%.6f")
+        ));
+
+        let filtered_logs = get_filtered_logs(Some("5s")).unwrap();
+        assert!(!filtered_logs.iter().any(|l| l.contains("Old entry")));
+        assert!(get_filtered_logs(Some("invalid")).is_err());
+    }
 }

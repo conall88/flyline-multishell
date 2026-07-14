@@ -5,10 +5,8 @@ use crossterm::QueueableCommand;
 use crossterm::cursor::{MoveTo, RestorePosition, SavePosition};
 use ratatui::prelude::Position;
 
-use crate::{bash_funcs, bash_symbols};
-
 static IS_VSCODE: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-    bash_funcs::get_envvar_value("TERM_PROGRAM").as_deref() == Some("vscode")
+    crate::shell::backend().env_var("TERM_PROGRAM").as_deref() == Some("vscode")
 });
 
 /// https://code.visualstudio.com/docs/terminal/shell-integration#_supported-escape-sequences
@@ -124,7 +122,7 @@ impl EscapeCodes {
 
 impl Command for EscapeCodes {
     fn write_ansi(&self, f: &mut impl core::fmt::Write) -> core::fmt::Result {
-        let bash_pid = unsafe { bash_symbols::shell_pgrp };
+        let bash_pid = crate::shell::backend().shell_pgrp();
 
         match self {
             // OSC 7
@@ -276,7 +274,7 @@ pub fn write_after_rendering_codes(
 
 pub fn write_on_exit_codes(commandline: Option<&str>) -> std::io::Result<()> {
     let codes: Vec<EscapeCodes> = if is_vscode() {
-        let nonce = bash_funcs::get_envvar_value("VSCODE_NONCE");
+        let nonce = crate::shell::backend().env_var("VSCODE_NONCE");
         log::info!("vscode_nonce: {:?}", nonce);
         match commandline {
             Some(cmd) => vec![

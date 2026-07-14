@@ -2,11 +2,12 @@ use std::cell::OnceCell;
 use std::time::Instant;
 use std::vec;
 
+use crate::content_utils;
 use crate::content_utils::apply_match_indices_to_lines;
 use crate::palette::Palette;
 use crate::settings::Settings;
+use crate::shell::backend;
 use crate::stateful_sliding_window::StatefulSlidingWindow;
-use crate::{bash_symbols, content_utils};
 use flash::lexer::TokenKind;
 use itertools::Itertools;
 use ratatui::text::{Line, Span};
@@ -160,51 +161,11 @@ impl HistoryManager {
     }
 
     pub fn parse_bash_history_from_memory() -> Vec<HistoryEntry> {
-        let mut res = Vec::with_capacity(4096);
-        unsafe {
-            let hist_array = bash_symbols::history_list();
-            if hist_array.is_null() {
-                log::warn!("History list is null");
-                return res;
-            }
-
-            let mut index = 0;
-            loop {
-                let entry_ptr = *hist_array.offset(index);
-                if entry_ptr.is_null() {
-                    break;
-                }
-
-                let hist_entry = &*entry_ptr;
-
-                // Check if line pointer is valid before dereferencing
-                if !hist_entry.line.is_null() {
-                    let command_cstr = std::ffi::CStr::from_ptr(hist_entry.line);
-                    let command_str = command_cstr.to_string_lossy().into_owned();
-
-                    // Parse timestamp if available
-                    let timestamp = if !hist_entry.timestamp.is_null() {
-                        let timestamp_cstr = std::ffi::CStr::from_ptr(hist_entry.timestamp);
-                        if let Ok(timestamp_str) = timestamp_cstr.to_str() {
-                            // If there are no timestamps in the history file,
-                            // Bash will use the current time for all entries, which can lead to many identical timestamps.
-                            let ts_str = timestamp_str.trim_start_matches('#').trim();
-                            ts_str.parse::<u64>().ok()
-                        } else {
-                            None
-                        }
-                    } else {
-                        None
-                    };
-
-                    let entry = HistoryEntry::new(timestamp, index as usize, command_str);
-                    res.push(entry);
-                }
-
-                index += 1;
-            }
-        }
-        res
+        backend()
+            .parse_history_from_memory()
+            .into_iter()
+            .map(|record| HistoryEntry::new(record.timestamp, record.index, record.command))
+            .collect()
     }
 
     fn parse_zsh_history(custom_path: Option<&str>) -> Vec<HistoryEntry> {
@@ -251,21 +212,24 @@ impl HistoryManager {
     }
 
     pub fn new(settings: &Settings) -> HistoryManager {
-        // Bash will load the history into memory, so we can read it from there
-        // Bash parses it after bashrc is loaded.
-        let bash_entries = Self::parse_bash_history_from_memory();
-        Self::log_recent_entries(&bash_entries, "bash");
-
-        // Alternative is to do it ourselves
-        // let bash_entries = Self::parse_bash_history_from_file();
-
-        let entries = if let Some(ref zsh_path) = settings.zsh_history_path {
-            // As a Zsh user migrating to Bash, I want to have my Zsh history available too
-            let zsh_entries = Self::parse_zsh_history(Some(zsh_path.as_str()));
-            Self::log_recent_entries(&zsh_entries, "Zsh");
-            Self::merge_history_entries(zsh_entries, bash_entries)
+        let entries = if Settings::is_zsh_host() {
+            let zsh_path = settings.zsh_history_path.as_deref();
+            let zsh_entries = Self::parse_zsh_history(zsh_path);
+            Self::log_recent_entries(&zsh_entries, "zsh");
+            Self::normalize_entries(zsh_entries)
         } else {
-            Self::normalize_entries(bash_entries)
+            // Bash loads history into memory after bashrc; read it from there.
+            let bash_entries = Self::parse_bash_history_from_memory();
+            Self::log_recent_entries(&bash_entries, "bash");
+
+            if let Some(ref zsh_path) = settings.zsh_history_path {
+                // As a Zsh user migrating to Bash, merge Zsh file history too.
+                let zsh_entries = Self::parse_zsh_history(Some(zsh_path.as_str()));
+                Self::log_recent_entries(&zsh_entries, "Zsh");
+                Self::merge_history_entries(zsh_entries, bash_entries)
+            } else {
+                Self::normalize_entries(bash_entries)
+            }
         };
 
         let index = entries.len();

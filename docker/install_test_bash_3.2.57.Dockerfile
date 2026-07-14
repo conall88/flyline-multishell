@@ -1,9 +1,30 @@
 FROM specific-bash-version
 
+# Fork/release parameters. Defaults target the current fork; override via Bake
+# args to point at a different repo, version, or asset source.
+ARG FLYLINE_REPO=conall88/flyline-multishell
 ARG FLYLINE_INSTALL_VERSION
+# When set to a local directory (e.g. /opt/flyline-assets) or an HTTP(S) base
+# URL, install.sh consumes release assets from there instead of GitHub. Left
+# empty by default so the standard GitHub download path is exercised.
+#
+# NOTE: This image ships Bash 3.2.57, so install.sh resolves the
+# libflyline-<version>-x86_64-unknown-linux-gnu_pre_bash_4_4 archive. A local
+# FLYLINE_ASSET_BASE must therefore contain a _pre_bash_4_4-named asset.
+ARG FLYLINE_ASSET_BASE=
 
 RUN apt-get update && apt-get install -y curl && rm -rf /var/lib/apt/lists/*
 
-RUN curl -sSfL https://github.com/HalFrgrd/flyline/releases/download/${FLYLINE_INSTALL_VERSION}/install.sh | FLYLINE_INSTALL_VERSION=${FLYLINE_INSTALL_VERSION} sh
+# Test the current tree's installer, not a previously published copy.
+COPY install.sh /tmp/flyline-install.sh
+# Locally produced release assets (populated by the `build-release-assets` Bake
+# target). Always present so the COPY resolves; only used when FLYLINE_ASSET_BASE
+# points here.
+COPY docker/build-release-assets/ /opt/flyline-assets/
+
+RUN FLYLINE_REPO="${FLYLINE_REPO}" \
+    FLYLINE_INSTALL_VERSION="${FLYLINE_INSTALL_VERSION}" \
+    FLYLINE_ASSET_BASE="${FLYLINE_ASSET_BASE}" \
+    sh /tmp/flyline-install.sh
 
 RUN /bin/bash -i -c "flyline --version"

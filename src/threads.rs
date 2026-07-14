@@ -130,6 +130,9 @@ where
 }
 
 pub(crate) fn join_bash_func_threads() {
+    if !crate::shell::backend().is_bash() {
+        return;
+    }
     let mut to_join = Vec::new();
     if let Ok(mut guard) = BACKGROUND_THREADS.lock() {
         let mut i = 0;

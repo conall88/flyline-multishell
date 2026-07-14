@@ -186,7 +186,7 @@ pub enum PaletteStyleKind {
 /// Use [`Palette::apply_theme`] to reset all slots from a built-in preset,
 /// then call [`Palette::set`] (or set the public fields directly) to customise
 /// individual slots.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Palette {
     recognised_command: Style,
     unrecognised_command: Style,
