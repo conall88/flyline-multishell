@@ -138,23 +138,27 @@ fn run_flyline_compspec(
             let processed: Vec<ProcessedSuggestion> = candidates
                 .into_iter()
                 .filter_map(|c| {
-                    let value = c.get_value().to_string_lossy().to_string();
-                    let value = if let Some(qt) = quote_type {
-                        crate::bash_funcs::quoting_function_rust(&value, qt, true, false)
-                    } else {
-                        value.clone()
-                    };
+                    let raw_value = c.get_value().to_string_lossy().to_string();
+                    let (mut prefix, value) =
+                        if let Some(delim_pos) = raw_value.find("PREFIX_DELIM") {
+                            let p = raw_value[..delim_pos].to_string();
+                            let v = raw_value[delim_pos + "PREFIX_DELIM".len()..].to_string();
+                            (p, v)
+                        } else {
+                            (String::new(), raw_value)
+                        };
+                    if !word_under_cursor.starts_with(&prefix) {
+                        prefix = String::new();
+                    }
                     let (value, suffix) = if let Some(stripped) = value.strip_suffix("NO_SUFFIX") {
                         (stripped.to_string(), "")
                     } else {
                         (value, " ")
                     };
-                    let (prefix, value) = if let Some(delim_pos) = value.find("PREFIX_DELIM") {
-                        let p = value[..delim_pos].to_string();
-                        let v = value[delim_pos + "PREFIX_DELIM".len()..].to_string();
-                        (p, v)
+                    let value = if let Some(qt) = quote_type {
+                        crate::bash_funcs::quoting_function_rust(&value, qt, true, false)
                     } else {
-                        (String::new(), value)
+                        value
                     };
 
                     let description = match c.get_help() {
@@ -2071,6 +2075,31 @@ mod tab_completion_tests {
             let mut items = words[1..].to_vec();
             items.sort();
             assert_eq!(items, vec!["foo1/", "foo2/", "foo3/"]);
+        }
+
+        #[test]
+        fn test_getsub_completions() {
+            cd_to_example_fs();
+
+            // 1. Completing the options
+            let actual = run_completion("getsub --");
+            let names: Vec<&str> = actual.iter().map(|s| s.s.as_str()).collect();
+            assert_eq!(names, vec![
+                "--alternative=",
+                "--fix-audio=",
+                "--subtitle-type=",
+                "--translate-from="
+            ]);
+
+            // 2. Completing the value after `=` (empty input)
+            let actual = run_completion("getsub --subtitle-type=");
+            let names: Vec<&str> = actual.iter().map(|s| s.s.as_str()).collect();
+            assert_eq!(names, vec!["json", "srt", "tsv", "txt", "vtt"]);
+
+            // 3. Completing the value after `=` with a prefix `t`
+            let actual = run_completion("getsub --subtitle-type=t");
+            let names: Vec<&str> = actual.iter().map(|s| s.s.as_str()).collect();
+            assert_eq!(names, vec!["tsv", "txt"]);
         }
     }
 }

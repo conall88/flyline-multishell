@@ -1,5 +1,25 @@
 pub(crate) const CHANGELOG: &str = r#"# Changelog
 
+## v1.3.0
+- **Leader Keys**: Added support for chorded keybinding sequences (e.g., `Ctrl+x` followed by `Ctrl+f`) via the new `setLeaderKey` and `unsetLeaderKey` actions and the `leaderKeyActive` context variable.
+- **Leader Key Visual Feedback**: Introduced the `leader-mode` prompt widget to display visual indicators (like ` X `) in the prompt when the leader key state is active.
+- **String Insertion Action**: `insertString(...)` action allows inserting arbitrary strings into the buffer.
+- **Strict Modifier Matching**: Switched to strict modifier equality matching to prevent modifier-overlap conflicts when dispatching key actions.
+- **Key List Autocomplete & Completion**: Added autocomplete support for listing keybindings for a specific key event (`flyline key list <key>`).
+
+## v1.2.5
+- **Global Allocator**: Integrated `mimalloc` to bypass Bash's non-thread-safe allocator and prevent heap corruption on multi-threaded allocations.
+- **Nested Arithmetic Lexing**: Stateful lexing updates to correctly parse nested brackets/parentheses inside arithmetic `$(( ... ))` blocks.
+- **Word Under Cursor breaks**: Updated word-under-cursor (WUC) detection to respect `:` and `=`, matching bash's standard `COMP_WORD_BREAK` behavior.
+- **Kitty Cursor Support**: Added backend selection to keep the terminal emulator cursor visible on Kitty, preventing prompts when closing the window.
+
+## v1.2.4
+- **Safety Guards**: Fixed a Use-After-Free (UAF) issue, added safety guards, and enforced usage of the thread manager.
+- **Mouse UX Improvements**: Corrected mouse event output formatting and resolved layout bugs, ensuring mouse event rows are always fully printed.
+- **Robust WUC Handling**: Patched Word Under Cursor (WUC) edge cases and downgraded internal assertions to errors to prevent shell crashes.
+- **AUR Package**: Documented and referenced the official Arch Linux User Repository (AUR) package.
+- **Cleanups**: Removed the legacy `get_current_readline_prompt` hook dependency to streamline FFI interactions.
+
 ## v1.2.3
 - **Thread Safety**: Added `BASH_LOCK` to prevent concurrency crashes when accessing Bash FFI from background threads.
 - **Log Forwarding**: Pipes tab-completion child logs back to the parent to prevent double-logging and preserve trails.

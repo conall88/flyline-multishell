@@ -481,13 +481,17 @@ impl<'a> App<'a> {
             && self.settings.key_debug
             && let Some(last_key) = &self.last_key
         {
+            let actions_str = last_key
+                .actions
+                .iter()
+                .map(|a| a.as_str())
+                .collect::<Vec<_>>()
+                .join("+");
             content.write_tagged_line(
                 &TaggedLine::from_line(
                     Line::from(format!(
                         "key: {}  context: {}  action: {}",
-                        last_key.display,
-                        last_key.context,
-                        last_key.action.as_ref()
+                        last_key.display, last_key.context, actions_str
                     ))
                     .style(
                         self.settings
@@ -550,9 +554,14 @@ impl<'a> App<'a> {
 
         content.prompt_start = Some(content.cursor_position());
 
+        let leader_active = self.leader_key_active_at.map_or(false, |t| {
+            t.elapsed() < std::time::Duration::from_millis(1000)
+        });
+
         let (mut lprompt, rprompt, fill_span) = self.prompt_manager.get_ps1_lines(
             self.settings.show_animations,
             self.mouse_state.is_enabled(),
+            leader_active,
             self.mode.is_running(),
         );
 
@@ -732,7 +741,7 @@ impl<'a> App<'a> {
                 cursor_pos
             };
             let cursor_style = {
-                if self.settings.cursor_config.backend == CursorBackend::Terminal {
+                if self.settings.cursor_config.backend() == CursorBackend::Terminal {
                     None
                 } else {
                     let focused = self.term_has_focus
@@ -1528,7 +1537,7 @@ impl<'a> App<'a> {
         };
 
         if let Some(term_em_cursor) = drawn_content.term_em_cursor_pos()
-            && (self.settings.cursor_config.backend == CursorBackend::Terminal
+            && (self.settings.cursor_config.backend() == CursorBackend::Terminal
                 || !self.mode.is_running())
             && !(self.mouse_state.is_left_button_down()
                 && self.buffer.selection_range().is_some()
@@ -1688,6 +1697,14 @@ impl<'a> App<'a> {
         }
 
         let term_width = width as usize;
+
+        // A zero-width terminal (reported transiently right after `exec`, during
+        // a resize, or by some emulators) leaves no room for a popup and would
+        // underflow the box-width math below (which panics under the release
+        // profile's `overflow-checks`). Nothing useful can be drawn, so bail.
+        if term_width == 0 {
+            return;
+        }
 
         let suggestion_prefix_width = active_suggestions
             .processed_suggestions
@@ -1969,7 +1986,7 @@ impl<'a> App<'a> {
         );
 
         content.draw_vertical_scrollbar(
-            x + box_width as u16 - 1,
+            x + (box_width as u16).saturating_sub(1),
             y + 1,
             total_item_rows as u16,
             active_suggestions.filtered_suggestions_len(),
@@ -2008,6 +2025,12 @@ impl<'a> App<'a> {
 
         let grid_start_row = content.cursor_position().row;
         let term_width = width as usize;
+
+        // See `render_auto_suggestions`: a zero-width terminal has no room for the
+        // popup and would underflow the box math (panics under `overflow-checks`).
+        if term_width == 0 {
+            return;
+        }
 
         let loading_text = LOADING_TEXT;
         let inner_width = unicode_width::UnicodeWidthStr::width(loading_text);
@@ -2128,6 +2151,27 @@ mod tests {
             7,
         );
         assert_eq!(anchor, 0);
+    }
+
+    #[test]
+    fn test_auto_suggestions_popup_anchor_col_with_prefix() {
+        let anchor = auto_suggestions_popup_anchor_col(
+            10,
+            &SubString::from_parts("src/l", 5),
+            4,
+            "echo src/l",
+            10,
+        );
+        assert_eq!(anchor, 8);
+
+        let anchor = auto_suggestions_popup_anchor_col(
+            12,
+            &SubString::from_parts("", 19),
+            0,
+            "bind Ctrl+n always=",
+            19,
+        );
+        assert_eq!(anchor, 11);
     }
 
     #[test]
@@ -2640,5 +2684,102 @@ mod tests {
         let cell = &content.buf[6][5];
         assert_eq!(cell.cell.symbol(), "X");
         assert_eq!(cell.tag, tag_sentinel);
+    }
+
+    /// Regression: a terminal reporting 0 columns (seen transiently right after
+    /// `exec`, during a resize, or with some emulators) must not panic. Before
+    /// the width guard, the popup box math underflowed `0u16 - 1`, which panics
+    /// under the release profile's `overflow-checks` and took down the editor.
+    #[test]
+    fn test_render_auto_suggestions_zero_width_does_not_panic() {
+        use crate::active_suggestions::{
+            ActiveSuggestions, ActiveSuggestionsBuilder, ProcessedSuggestion,
+        };
+        use crate::settings::Settings;
+
+        let settings = Settings::default();
+        let mut content = Contents::new(0);
+
+        let builder = ActiveSuggestionsBuilder {
+            processed: vec![
+                ProcessedSuggestion::new("sug1", "", ""),
+                ProcessedSuggestion::new("sug2", "", ""),
+            ],
+            unprocessed: std::collections::VecDeque::new(),
+            common_prefix: None,
+            auto_accept_if_solo: false,
+            insert_common_prefix: false,
+            comp_type: crate::tab_completion_context::CompType::FirstWord,
+            nosort: false,
+            compspec_was_useful: Some(true),
+            should_run_flycomp: false,
+        };
+
+        let mut active = ActiveSuggestions::new(
+            builder,
+            crate::text_buffer::SubString::new("", "").unwrap(),
+            std::time::Duration::from_millis(0),
+            true, // auto_started
+            crate::settings::SuggestionSortOrder::default(),
+            crate::settings::FuzzyMode::default(),
+        );
+        active.selected_coord = Some((0, 0));
+
+        // Would panic (subtract overflow) without the zero-width guard.
+        App::render_auto_suggestions(
+            &settings,
+            &mut active,
+            &mut content,
+            0,                // width
+            20,               // rows_left_before_end_of_screen
+            None,             // cursor_pos_maybe
+            "",               // buffer
+            0,                // cursor_byte_pos
+            Style::default(), // scrollbar_style
+        );
+
+        // Nothing was drawn: no popup border on a zero-width terminal.
+        assert!(
+            content
+                .buf
+                .iter()
+                .flat_map(|row| row.iter())
+                .all(|c| c.cell.symbol() != "╭"),
+            "no suggestion popup should be drawn at zero width",
+        );
+    }
+
+    /// Companion to the above for the loading-state popup, which shares the same
+    /// zero-width underflow hazard.
+    #[test]
+    fn test_render_auto_suggestions_loading_zero_width_does_not_panic() {
+        use crate::settings::Settings;
+
+        let settings = Settings::default();
+        let mut content = Contents::new(0);
+        let now = std::time::Instant::now();
+        let wuc = crate::text_buffer::SubString::new("", "").unwrap();
+
+        // Would panic (subtract overflow) without the zero-width guard.
+        App::render_auto_suggestions_loading(
+            &settings,
+            &mut content,
+            0,    // width
+            None, // cursor_pos_maybe
+            "",   // buffer
+            0,    // cursor_byte_pos
+            &wuc,
+            now,
+            now,
+        );
+
+        assert!(
+            content
+                .buf
+                .iter()
+                .flat_map(|row| row.iter())
+                .all(|c| c.cell.symbol() != "╭"),
+            "no loading popup should be drawn at zero width",
+        );
     }
 }

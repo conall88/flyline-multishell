@@ -22,17 +22,7 @@ pub(crate) type ContextValues = super::ContextValues<ContextVar>;
 /// Actions are not scoped — the binding's `ContextExpr` controls when
 /// the action runs.
 #[derive(
-    Clone,
-    Copy,
-    Debug,
-    PartialEq,
-    Eq,
-    Hash,
-    EnumIter,
-    EnumString,
-    AsRefStr,
-    IntoStaticStr,
-    EnumMessage,
+    Debug, Clone, PartialEq, Eq, Hash, EnumIter, EnumString, AsRefStr, IntoStaticStr, EnumMessage,
 )]
 #[strum(serialize_all = "camelCase")]
 pub enum KeyEventAction {
@@ -120,6 +110,8 @@ pub enum KeyEventAction {
     RunFuzzyCancelledHistorySearch,
     #[strum(message = "Clear the screen")]
     ClearScreen,
+    #[strum(message = "Clear the text buffer")]
+    ClearBuffer,
     #[strum(message = "Delete until start of line")]
     DeleteLeftUntilStartOfLine,
     #[strum(
@@ -224,18 +216,37 @@ pub enum KeyEventAction {
     PromptDirMoveToEnd,
     #[strum(message = "Return to the normal command editing mode")]
     EscapeToNormalMode,
+    #[strum(message = "Activate the leader key state")]
+    SetLeaderKey,
+    #[strum(message = "Deactivate the leader key state")]
+    UnsetLeaderKey,
+    #[strum(message = "Insert a literal string of characters", disabled)]
+    InsertString(String),
 }
 
 impl KeyEventAction {
     /// The camelCase action name as exposed in the CLI.
     pub fn as_str(&self) -> &'static str {
-        <&'static str>::from(self)
+        match self {
+            KeyEventAction::InsertString(_) => "insertString",
+            _ => <&'static str>::from(self),
+        }
     }
 
     /// Human-readable description of what the action does.  Sourced from the
     /// strum `message` attribute on each variant.
     pub fn description(&self) -> &'static str {
-        self.get_message().unwrap_or("")
+        match self {
+            KeyEventAction::InsertString(_) => "Insert a literal string of characters",
+            _ => self.get_message().unwrap_or(""),
+        }
+    }
+
+    pub fn display_name(&self) -> String {
+        match self {
+            KeyEventAction::InsertString(s) => format!("insertString('{}')", s.escape_debug()),
+            _ => self.as_str().to_string(),
+        }
     }
 
     /// Run the action's logic against the given `App` and key event.
@@ -519,6 +530,9 @@ impl KeyEventAction {
             }
             KeyEventAction::ClearScreen => {
                 app.needs_screen_cleared = true;
+            }
+            KeyEventAction::ClearBuffer => {
+                app.buffer.replace_buffer("");
             }
             KeyEventAction::DeleteLeftUntilStartOfLine => {
                 if app.buffer.delete_selection() {
@@ -898,6 +912,16 @@ impl KeyEventAction {
                 app.buffer.clear_selection();
                 app.content_mode = ContentMode::Normal;
             }
+            KeyEventAction::SetLeaderKey => {
+                app.leader_key_active_at = Some(std::time::Instant::now());
+            }
+            KeyEventAction::UnsetLeaderKey => {
+                app.leader_key_active_at = None;
+            }
+            KeyEventAction::InsertString(s) => {
+                app.buffer.delete_selection();
+                app.buffer.insert_str(s);
+            }
         }
     }
 }
@@ -1034,6 +1058,8 @@ pub enum KeyRemap {
         from: KeyModifiers,
         to: KeyModifiers,
     },
+    /// Remap a key event with modifiers to another key event.
+    Event { from: KeyEvent, to: KeyEvent },
 }
 
 /// Parse a single key-code name (no modifiers) into a [`KeyCode`].
@@ -1158,6 +1184,17 @@ fn parse_single_modifier(s: &str) -> Result<KeyModifiers> {
 /// Parse and validate a remap pair (from, to).  Modifiers may only be remapped
 /// to modifiers; keys may only be remapped to keys.
 pub fn try_parse_remap(from: &str, to: &str) -> Result<KeyRemap> {
+    if let Ok(KeyEventMatch::Exact(from_event)) = KeyEventMatch::try_from(from) {
+        if let Ok(KeyEventMatch::Exact(to_event)) = KeyEventMatch::try_from(to) {
+            if !from_event.modifiers.is_empty() || !to_event.modifiers.is_empty() {
+                return Ok(KeyRemap::Event {
+                    from: from_event,
+                    to: to_event,
+                });
+            }
+        }
+    }
+
     let from_mod = parse_single_modifier(from);
     let to_mod = parse_single_modifier(to);
     match (&from_mod, &to_mod) {
@@ -1198,7 +1235,20 @@ pub fn apply_remappings(key: KeyEvent, remappings: &[KeyRemap]) -> KeyEvent {
         return key;
     }
 
-    // Modifier remaps are applied simultaneously from the original modifier set.
+    // 1. Key event remappings take precedence
+    for remap in remappings {
+        if let KeyRemap::Event { from, to } = remap {
+            if key.code == from.code && key.modifiers == from.modifiers {
+                return KeyEvent {
+                    code: to.code,
+                    modifiers: to.modifiers,
+                    ..key
+                };
+            }
+        }
+    }
+
+    // 2. Modifier remaps are applied simultaneously from the original modifier set.
     let original_modifiers = key.modifiers;
     let mut new_modifiers = KeyModifiers::empty();
     for &bit in &[
@@ -1240,18 +1290,28 @@ pub fn apply_remappings(key: KeyEvent, remappings: &[KeyRemap]) -> KeyEvent {
 pub struct Binding {
     key_events: Vec<KeyEventMatch>,
     context: ContextExpr,
-    action: KeyEventAction,
+    actions: Vec<KeyEventAction>,
 }
 
 impl Binding {
     /// Create a binding from a list of [`KeyEventMatch`] values, a context
-    /// expression, and an action.  This is infallible: parsing happens at
+    /// expression, and a slice of actions.  This is infallible: parsing happens at
     /// compile time via the typed `KeyCode` / `KeyModifiers` constructors.
-    fn new(key_events: &[KeyEventMatch], context: ContextExpr, action: KeyEventAction) -> Self {
+    pub fn new(
+        key_events: &[KeyEventMatch],
+        context: ContextExpr,
+        actions: &[KeyEventAction],
+    ) -> Self {
+        let mut unique_events = Vec::new();
+        for event in key_events {
+            if !unique_events.contains(event) {
+                unique_events.push(event.clone());
+            }
+        }
         Self {
-            key_events: key_events.to_vec(),
+            key_events: unique_events,
             context,
-            action,
+            actions: actions.to_vec(),
         }
     }
 
@@ -1265,12 +1325,46 @@ impl Binding {
             )
         })?;
         let action_str = action_str.trim();
-        let action = KeyEventAction::try_from(action_str)
-            .map_err(|_| anyhow::anyhow!("Unknown action: '{}'", action_str))?;
+        let actions: Vec<KeyEventAction> = action_str
+            .split('+')
+            .map(|s| {
+                let s = s.trim();
+                if let Some(stripped) = s.strip_prefix("insertString(") {
+                    if !stripped.ends_with(')') {
+                        return Err(anyhow::anyhow!(
+                            "Invalid insertString syntax: '{}'. Expected 'insertString(value)'",
+                            s
+                        ));
+                    }
+                    let inner = &stripped[..stripped.len() - 1];
+                    let inner_trimmed = if (inner.starts_with('"') && inner.ends_with('"'))
+                        || (inner.starts_with('\'') && inner.ends_with('\''))
+                    {
+                        if inner.len() >= 2 {
+                            &inner[1..inner.len() - 1]
+                        } else {
+                            inner
+                        }
+                    } else {
+                        inner
+                    };
+                    let unescaped = unescape_string(inner_trimmed);
+                    Ok(KeyEventAction::InsertString(unescaped))
+                } else {
+                    KeyEventAction::try_from(s)
+                        .map_err(|_| anyhow::anyhow!("Unknown action: '{}'", s))
+                }
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        if actions.is_empty() {
+            return Err(anyhow::anyhow!("No actions specified"));
+        }
+
         Ok(Self::new(
             &[KeyEventMatch::try_from(key_event)?],
             ContextExpr::try_from(context_str.trim())?,
-            action,
+            &actions,
         ))
     }
 
@@ -1278,13 +1372,68 @@ impl Binding {
         self.key_events.iter().any(|k| match k {
             KeyEventMatch::Exact(action_binding) => {
                 keycodes_match(action_binding.code, key.code)
-                    && key.modifiers.contains(action_binding.modifiers)
+                    && key.modifiers == action_binding.modifiers
             }
             KeyEventMatch::AnyCharAndMods(mods) => {
-                matches!(key.code, KeyCode::Char(_)) && key.modifiers.contains(*mods)
+                matches!(key.code, KeyCode::Char(_)) && key.modifiers == *mods
             }
         })
     }
+}
+
+fn unescape_string(s: &str) -> String {
+    let mut result = String::new();
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            if let Some(&next_c) = chars.peek() {
+                match next_c {
+                    'n' => {
+                        result.push('\n');
+                        chars.next();
+                    }
+                    't' => {
+                        result.push('\t');
+                        chars.next();
+                    }
+                    'r' => {
+                        result.push('\r');
+                        chars.next();
+                    }
+                    'e' => {
+                        result.push('\x1b');
+                        chars.next();
+                    }
+                    'x' => {
+                        chars.next(); // consume 'x'
+                        let mut hex = String::new();
+                        if let Some(h1) = chars.next() {
+                            hex.push(h1);
+                        }
+                        if let Some(h2) = chars.next() {
+                            hex.push(h2);
+                        }
+                        if let Ok(val) = u8::from_str_radix(&hex, 16) {
+                            result.push(val as char);
+                        } else {
+                            result.push('\\');
+                            result.push('x');
+                            result.extend(hex.chars());
+                        }
+                    }
+                    _ => {
+                        result.push(next_c);
+                        chars.next();
+                    }
+                }
+            } else {
+                result.push('\\');
+            }
+        } else {
+            result.push(c);
+        }
+    }
+    result
 }
 
 fn keycodes_match(a: KeyCode, b: KeyCode) -> bool {
@@ -1536,20 +1685,66 @@ pub fn possible_context_action_completions(current: &std::ffi::OsStr) -> Vec<Com
     if let Some(eq_idx) = current.rfind('=') {
         let prefix = &current[..=eq_idx];
         let action_part = &current[eq_idx + 1..];
-        let action_lower = action_part.to_lowercase();
-        return KeyEventAction::iter()
+        let last_plus_idx = action_part.rfind('+');
+        let (action_prefix, last_action_str) = if let Some(idx) = last_plus_idx {
+            (&action_part[..=idx], &action_part[idx + 1..])
+        } else {
+            ("", action_part)
+        };
+
+        // If the last action part is a fully matching action
+        if let Ok(action) = KeyEventAction::try_from(last_action_str.trim()) {
+            return vec![
+                // Option 1: done adding actions (appends a space suffix)
+                CompletionCandidate::new(format!(
+                    "{}PREFIX_DELIM{}{}",
+                    prefix,
+                    action_prefix,
+                    action.as_str()
+                ))
+                .help(action.get_message().map(clap::builder::StyledStr::from)),
+                // Option 2: want to chain another action (appends '+' and suppresses space)
+                CompletionCandidate::new(format!(
+                    "{}PREFIX_DELIM{}{}+NO_SUFFIX",
+                    prefix,
+                    action_prefix,
+                    action.as_str()
+                ))
+                .help(action.get_message().map(clap::builder::StyledStr::from)),
+            ];
+        }
+
+        // Otherwise, complete the partial action name
+        let action_lower = last_action_str.trim().to_lowercase();
+        let mut candidates: Vec<CompletionCandidate> = KeyEventAction::iter()
             .filter_map(|a| {
                 let s = a.as_str();
                 if s.to_lowercase().contains(&action_lower) {
                     Some(
-                        CompletionCandidate::new(format!("{}PREFIX_DELIM{}", prefix, s))
-                            .help(a.get_message().map(clap::builder::StyledStr::from)),
+                        CompletionCandidate::new(format!(
+                            "{}PREFIX_DELIM{}{}NO_SUFFIX",
+                            prefix, action_prefix, s
+                        ))
+                        .help(a.get_message().map(clap::builder::StyledStr::from)),
                     )
                 } else {
                     None
                 }
             })
             .collect();
+
+        if "insertstring".contains(&action_lower) {
+            candidates.push(
+                CompletionCandidate::new(format!(
+                    "{}PREFIX_DELIM{}{}NO_SUFFIX",
+                    prefix, action_prefix, "insertString(value)"
+                ))
+                .help(Some(clap::builder::StyledStr::from(
+                    "Insert a literal string of characters",
+                ))),
+            );
+        }
+        return candidates;
     }
     // Completing context variables.  Determine the prefix already typed
     // (everything up to and including the last `+`) and the partial
@@ -1682,6 +1877,27 @@ pub fn key_sequence_completer(current: &std::ffi::OsStr) -> Vec<CompletionCandid
     out
 }
 
+/// Completer for key remapping args.
+/// Suggests standard key sequences as well as standalone capitalized modifier names.
+pub fn remap_key_completer(current: &std::ffi::OsStr) -> Vec<CompletionCandidate> {
+    let current_str = current.to_string_lossy();
+    let current_lower = current_str.to_lowercase();
+
+    // 1. Get the normal key sequence completions (e.g. including "Ctrl+", "Alt+", etc.)
+    let mut out = key_sequence_completer(current);
+
+    // 2. Also support remapping standalone modifiers (e.g. "Ctrl", "Alt", "Shift", etc.).
+    for (_, mod_equivs) in MODS_TO_EQUIV_NAMES.iter() {
+        for equiv in *mod_equivs {
+            if equiv.to_lowercase().starts_with(&current_lower) {
+                out.push(CompletionCandidate::new(capitalize_first(equiv)));
+            }
+        }
+    }
+
+    out
+}
+
 fn capitalize_first(s: &str) -> String {
     let mut chars = s.chars();
     match chars.next() {
@@ -1721,22 +1937,22 @@ pub static DEFAULT_BINDINGS: LazyLock<Vec<Binding>> = LazyLock::new(|| {
                 KC::Down.into()
             ],
             ContextVar::TabCompletionAskForFlycomp.into(),
-            KeyEventAction::FlycompAskToggleChoice,
+            &[KeyEventAction::FlycompAskToggleChoice],
         ),
         Binding::new(
             &[KC::Tab.into()],
             ContextVar::TabCompletionAskForFlycomp.into(),
-            KeyEventAction::FlycompAskToggleChoice,
+            &[KeyEventAction::FlycompAskToggleChoice],
         ),
         Binding::new(
             &[KC::Enter.into()],
             ContextVar::TabCompletionAskForFlycomp.into(),
-            KeyEventAction::FlycompAskAcceptChoice,
+            &[KeyEventAction::FlycompAskAcceptChoice],
         ),
         Binding::new(
             &[KC::Esc.into()],
             ContextVar::TabCompletionAskForFlycomp.into(),
-            KeyEventAction::EscapeToNormalMode,
+            &[KeyEventAction::EscapeToNormalMode],
         ),
         Binding::new(
             &[
@@ -1745,13 +1961,13 @@ pub static DEFAULT_BINDINGS: LazyLock<Vec<Binding>> = LazyLock::new(|| {
                 M::SUPER + KC::Char('c').into(),
             ],
             ContextVar::TabCompletionAskForFlycomp.into(),
-            KeyEventAction::EscapeToNormalMode,
+            &[KeyEventAction::EscapeToNormalMode],
         ),
         // --- TabCompletionRunningFlycomp bindings ---
         Binding::new(
             &[KC::Esc.into()],
             ContextVar::TabCompletionRunningFlycomp.into(),
-            KeyEventAction::EscapeToNormalMode,
+            &[KeyEventAction::EscapeToNormalMode],
         ),
         Binding::new(
             &[
@@ -1760,13 +1976,13 @@ pub static DEFAULT_BINDINGS: LazyLock<Vec<Binding>> = LazyLock::new(|| {
                 M::SUPER + KC::Char('c').into(),
             ],
             ContextVar::TabCompletionRunningFlycomp.into(),
-            KeyEventAction::EscapeToNormalMode,
+            &[KeyEventAction::EscapeToNormalMode],
         ),
         // --- TabCompletionFlycompResult bindings ---
         Binding::new(
             &[KC::Esc.into(), KC::Enter.into(), KC::Backspace.into()],
             ContextVar::TabCompletionFlycompResult.into(),
-            KeyEventAction::EscapeToNormalMode,
+            &[KeyEventAction::EscapeToNormalMode],
         ),
         Binding::new(
             &expand_variations![
@@ -1776,7 +1992,7 @@ pub static DEFAULT_BINDINGS: LazyLock<Vec<Binding>> = LazyLock::new(|| {
                 KC::Down.into()
             ],
             ContextVar::TabCompletionFlycompResult.into(),
-            KeyEventAction::EscapeToNormalMode,
+            &[KeyEventAction::EscapeToNormalMode],
         ),
         Binding::new(
             &[
@@ -1785,77 +2001,77 @@ pub static DEFAULT_BINDINGS: LazyLock<Vec<Binding>> = LazyLock::new(|| {
                 M::SUPER + KC::Char('c').into(),
             ],
             ContextVar::TabCompletionFlycompResult.into(),
-            KeyEventAction::EscapeToNormalMode,
+            &[KeyEventAction::EscapeToNormalMode],
         ),
         Binding::new(
             &[KeyEventMatch::AnyCharAndMods(M::empty())],
             ContextVar::TabCompletionFlycompResult.into(),
-            KeyEventAction::EscapeToNormalMode,
+            &[KeyEventAction::EscapeToNormalMode],
         ),
         Binding::new(
             &[KC::Down.into()],
             ContextVar::AgentOutputSelection.into(),
-            KeyEventAction::AgentOutputSelectNext,
+            &[KeyEventAction::AgentOutputSelectNext],
         ),
         Binding::new(
             &[KC::Up.into()],
             ContextVar::AgentOutputSelection.into(),
-            KeyEventAction::AgentOutputSelectPrev,
+            &[KeyEventAction::AgentOutputSelectPrev],
         ),
         Binding::new(
             &[KC::Up.into()],
             !ContextVar::UserTriggeredSuggestions + ContextVar::TabCompletionEntrySelected,
-            KeyEventAction::TabCompletionMoveUp,
+            &[KeyEventAction::TabCompletionMoveUp],
         ),
         Binding::new(
             &[KC::Up.into()],
             ContextVar::UserTriggeredSuggestions.into(),
-            KeyEventAction::TabCompletionMoveUp,
+            &[KeyEventAction::TabCompletionMoveUp],
         ),
         Binding::new(
             &[KC::Down.into()],
             ContextVar::TabCompletionAvailable.into(),
-            KeyEventAction::TabCompletionMoveDown,
+            &[KeyEventAction::TabCompletionMoveDown],
         ),
         Binding::new(
             &[KC::Left.into()],
             ContextVar::TabCompletionMultiColAvailable.into(),
-            KeyEventAction::TabCompletionMoveLeft,
+            &[KeyEventAction::TabCompletionMoveLeft],
         ),
         Binding::new(
             &[KC::Right.into()],
             ContextVar::TabCompletionMultiColAvailable.into(),
-            KeyEventAction::TabCompletionMoveRight,
+            &[KeyEventAction::TabCompletionMoveRight],
         ),
         Binding::new(
             &[KC::PageUp.into()],
             ContextVar::TabCompletionAvailable.into(),
-            KeyEventAction::TabCompletionMovePageUp,
+            &[KeyEventAction::TabCompletionMovePageUp],
         ),
         Binding::new(
             &[KC::PageDown.into()],
             ContextVar::TabCompletionAvailable.into(),
-            KeyEventAction::TabCompletionMovePageDown,
+            &[KeyEventAction::TabCompletionMovePageDown],
         ),
         Binding::new(
             &[KC::Up.into()],
             ContextVar::FuzzyHistorySearch.into(),
-            KeyEventAction::FuzzyHistorySelectPrev,
+            &[KeyEventAction::FuzzyHistorySelectPrev],
         ),
         Binding::new(
             &[KC::Down.into(), M::CONTROL + KC::Char('s').into()],
             ContextVar::FuzzyHistorySearch.into(),
-            KeyEventAction::FuzzyHistorySelectNext,
+            &[KeyEventAction::FuzzyHistorySelectNext],
         ),
         Binding::new(
             &[KC::PageUp.into()],
             ContextVar::FuzzyHistorySearch.into(),
-            KeyEventAction::FuzzyHistoryScrollPageUp,
+            &[KeyEventAction::FuzzyHistoryScrollPageUp],
         ),
         Binding::new(
             &[KC::PageDown.into()],
             ContextVar::FuzzyHistorySearch.into(),
-            KeyEventAction::FuzzyHistoryScrollPageDown,
+            &[KeyEventAction::FuzzyHistoryScrollPageDown],
         ),
         Binding::new(
             &expand_variations![
@@ -1863,169 +2079,169 @@ pub static DEFAULT_BINDINGS: LazyLock<Vec<Binding>> = LazyLock::new(|| {
                 M::ALT + KC::Char('r').into(),
             ],
             ContextVar::FuzzyHistorySearch.into(),
-            KeyEventAction::EscapeToNormalMode, // Stop fuzzy history search if active, otherwise escape to normal mode
+            &[KeyEventAction::EscapeToNormalMode], // Stop fuzzy history search if active, otherwise escape to normal mode
         ),
         Binding::new(
             &expand_variations![KC::Enter.into()],
             ContextVar::BufferHasAgentModePrefix + ContextVar::EditingBufferMode,
-            KeyEventAction::RunAgentMode,
+            &[KeyEventAction::RunAgentMode],
         ),
         Binding::new(
             &expand_variations![M::ALT + KC::Enter.into()],
             ContextVar::Always.into(),
-            KeyEventAction::RunAgentMode,
+            &[KeyEventAction::RunAgentMode],
         ),
         Binding::new(
             &expand_variations![KC::Enter.into()],
             ContextVar::FuzzyHistorySearchAgentCommands.into(),
-            KeyEventAction::FuzzyHistoryAcceptAgentCommandEntry,
+            &[KeyEventAction::FuzzyHistoryAcceptAgentCommandEntry],
         ),
         Binding::new(
             &expand_variations![KC::Enter.into()],
             ContextVar::FuzzyHistorySearchNormalCommands.into(),
-            KeyEventAction::FuzzyHistoryAcceptEntry,
+            &[KeyEventAction::FuzzyHistoryAcceptEntry],
         ),
         Binding::new(
             &expand_variations![KC::Enter.into()],
             ContextVar::FuzzyHistorySearchCancelledCommands.into(),
-            KeyEventAction::FuzzyHistoryAcceptEntry,
+            &[KeyEventAction::FuzzyHistoryAcceptEntry],
         ),
         Binding::new(
             &expand_variations![M::CONTROL + KC::Enter.into(), M::SUPER + KC::Enter.into()],
             ContextVar::TabCompletionAvailable.into(),
-            KeyEventAction::TabCompletionAcceptAll,
+            &[KeyEventAction::TabCompletionAcceptAll],
         ),
         Binding::new(
             &expand_variations![KC::Enter.into()],
             ContextVar::TabCompletionEntrySelected.into(),
-            KeyEventAction::TabCompletionAcceptEntry,
+            &[KeyEventAction::TabCompletionAcceptEntry],
         ),
         Binding::new(
             &expand_variations![KC::Enter.into()],
             ContextVar::AgentModeError.into(),
-            KeyEventAction::AgentModeRunHelpCommand,
+            &[KeyEventAction::AgentModeRunHelpCommand],
         ),
         Binding::new(
             &expand_variations![KC::Enter.into()],
             ContextVar::AgentOutputNoneSelected.into(),
-            KeyEventAction::AgentOutputRunAgentMode,
+            &[KeyEventAction::AgentOutputRunAgentMode],
         ),
         Binding::new(
             &expand_variations![KC::Enter.into()],
             ContextVar::AgentOutputSelection.into(),
-            KeyEventAction::AgentOutputAcceptEntry,
+            &[KeyEventAction::AgentOutputAcceptEntry],
         ),
         // PromptCwdEdit Enter must appear before the Normal Enter binding.
         Binding::new(
             &expand_variations![KC::Enter.into()],
             ContextVar::PromptDirSelection.into(),
-            KeyEventAction::PromptDirAcceptEntry,
+            &[KeyEventAction::PromptDirAcceptEntry],
         ),
         Binding::new(
             &expand_variations![KC::Enter.into()],
             ContextVar::MultilineBuffer + ContextVar::CursorAtEndTrimmed,
-            KeyEventAction::SubmitOrNewline,
+            &[KeyEventAction::SubmitOrNewline],
         ),
         Binding::new(
             &expand_variations![KC::Enter.into()],
             ContextVar::MultilineBuffer.into(),
-            KeyEventAction::InsertNewline,
+            &[KeyEventAction::InsertNewline],
         ),
         Binding::new(
             &expand_variations![KC::Enter.into()],
             ContextVar::Always.into(),
-            KeyEventAction::SubmitOrNewline,
+            &[KeyEventAction::SubmitOrNewline],
         ),
         Binding::new(
             &expand_variations![KC::BackTab.into()],
             ContextVar::TabCompletionAvailable.into(),
-            KeyEventAction::TabCompletionPrevSuggestion,
+            &[KeyEventAction::TabCompletionPrevSuggestion],
         ),
         // Scoped Esc bindings must appear before the Normal Esc binding.
         Binding::new(
             &[KC::Tab.into()],
             ContextVar::FuzzyHistorySearchNoneSelected.into(),
-            KeyEventAction::FuzzyHistorySelectTopEntry,
+            &[KeyEventAction::FuzzyHistorySelectTopEntry],
         ),
         Binding::new(
             &[KC::Tab.into()],
             ContextVar::FuzzyHistorySearch.into(),
-            KeyEventAction::FuzzyHistorySelectNext,
+            &[KeyEventAction::FuzzyHistorySelectNext],
         ),
         Binding::new(
             &expand_variations![KC::BackTab.into()],
             ContextVar::FuzzyHistorySearch.into(),
-            KeyEventAction::FuzzyHistorySelectPrev,
+            &[KeyEventAction::FuzzyHistorySelectPrev],
         ),
         Binding::new(
             &expand_variations![KC::BackTab.into()],
             ContextVar::AgentOutputSelection.into(),
-            KeyEventAction::AgentOutputSelectPrev,
+            &[KeyEventAction::AgentOutputSelectPrev],
         ),
         Binding::new(
             &[KC::Tab.into()],
             ContextVar::AgentOutputNoneSelected.into(),
-            KeyEventAction::AgentOutputSelectFirstEntry,
+            &[KeyEventAction::AgentOutputSelectFirstEntry],
         ),
         Binding::new(
             &[KC::Tab.into()],
             ContextVar::AgentOutputSelection.into(),
-            KeyEventAction::AgentOutputNextSuggestion,
+            &[KeyEventAction::AgentOutputNextSuggestion],
         ),
         Binding::new(
             &[KC::Tab.into()],
             ContextVar::TabCompletionOneResult.into(),
-            KeyEventAction::TabCompletionAcceptEntry,
+            &[KeyEventAction::TabCompletionAcceptEntry],
         ),
         Binding::new(
             &[KC::Tab.into()],
             ContextVar::TabCompletionAvailable.into(),
-            KeyEventAction::TabCompletionNextSuggestion,
+            &[KeyEventAction::TabCompletionNextSuggestion],
         ),
         Binding::new(
             &[KC::Tab.into()],
             ContextVar::Always.into(),
-            KeyEventAction::RunTabCompletion,
+            &[KeyEventAction::RunTabCompletion],
         ),
         Binding::new(
             &[KC::Esc.into()],
             ContextVar::AgentModeError.into(),
-            KeyEventAction::EscapeToNormalMode,
+            &[KeyEventAction::EscapeToNormalMode],
         ),
         Binding::new(
             &[KC::Esc.into()],
             ContextVar::AgentModeWaiting.into(),
-            KeyEventAction::EscapeToNormalMode,
+            &[KeyEventAction::EscapeToNormalMode],
         ),
         Binding::new(
             &[KC::Esc.into()],
             ContextVar::AgentOutputSelection.into(),
-            KeyEventAction::EscapeToNormalMode,
+            &[KeyEventAction::EscapeToNormalMode],
         ),
         Binding::new(
             &[KC::Esc.into()],
             ContextVar::FuzzyHistorySearch.into(),
-            KeyEventAction::EscapeToNormalMode,
+            &[KeyEventAction::EscapeToNormalMode],
         ),
         Binding::new(
             &[KC::Esc.into()],
             ContextVar::PromptDirSelection.into(),
-            KeyEventAction::EscapeToNormalMode,
+            &[KeyEventAction::EscapeToNormalMode],
         ),
         Binding::new(
             &[KC::Esc.into()],
             ContextVar::TabCompletionAvailable.into(),
-            KeyEventAction::EscapeToNormalMode,
+            &[KeyEventAction::EscapeToNormalMode],
         ),
         Binding::new(
             &[KC::Esc.into()],
             ContextVar::TabCompletion.into(),
-            KeyEventAction::EscapeToNormalMode,
+            &[KeyEventAction::EscapeToNormalMode],
         ),
         Binding::new(
             &[KC::Esc.into()],
             ContextVar::TabCompletionWaiting.into(),
-            KeyEventAction::EscapeToNormalMode,
+            &[KeyEventAction::EscapeToNormalMode],
         ),
         // TextSelected Esc must appear before the Default Esc binding so that
         // pressing Esc with a selection active clears the selection rather
@@ -2033,12 +2249,12 @@ pub static DEFAULT_BINDINGS: LazyLock<Vec<Binding>> = LazyLock::new(|| {
         Binding::new(
             &[KC::Esc.into()],
             ContextVar::TextSelected.into(),
-            KeyEventAction::EscapeToNormalMode,
+            &[KeyEventAction::EscapeToNormalMode],
         ),
         Binding::new(
             &[KC::Esc.into()],
             ContextVar::Always.into(),
-            KeyEventAction::ToggleMouse,
+            &[KeyEventAction::ToggleMouse],
         ),
         // Ctrl+D / Super+D (Cmd+D on macOS): delete character under cursor when
         // the buffer is non-empty.  The BufferIsEmpty+Ctrl+D binding below takes
@@ -2049,12 +2265,12 @@ pub static DEFAULT_BINDINGS: LazyLock<Vec<Binding>> = LazyLock::new(|| {
                 M::SUPER + KC::Char('d').into(),
             ],
             (!ContextVar::BufferIsEmpty).into(),
-            KeyEventAction::DeleteRight,
+            &[KeyEventAction::DeleteRight],
         ),
         Binding::new(
             &[M::CONTROL + KC::Char('d').into()],
             ContextVar::BufferIsEmpty.into(),
-            KeyEventAction::Exit,
+            &[KeyEventAction::Exit],
         ),
         // TextSelected Ctrl+x cuts the selection to the clipboard.
         Binding::new(
@@ -2064,7 +2280,7 @@ pub static DEFAULT_BINDINGS: LazyLock<Vec<Binding>> = LazyLock::new(|| {
                 M::SUPER + KC::Char('x').into(),
             ],
             ContextVar::TextSelected.into(),
-            KeyEventAction::CutSelection,
+            &[KeyEventAction::CutSelection],
         ),
         // TextSelected Ctrl+c must appear before the Default Ctrl+c binding
         // so that copying the selection takes precedence over cancelling.
@@ -2075,7 +2291,7 @@ pub static DEFAULT_BINDINGS: LazyLock<Vec<Binding>> = LazyLock::new(|| {
                 M::SUPER + KC::Char('c').into(),
             ],
             ContextVar::TextSelected.into(),
-            KeyEventAction::CopySelectionOsc52,
+            &[KeyEventAction::CopySelectionOsc52],
         ),
         Binding::new(
             &[
@@ -2084,7 +2300,7 @@ pub static DEFAULT_BINDINGS: LazyLock<Vec<Binding>> = LazyLock::new(|| {
                 M::SUPER + KC::Char('c').into(),
             ],
             ContextVar::Always.into(),
-            KeyEventAction::Cancel,
+            &[KeyEventAction::Cancel],
         ),
         // Paste from system clipboard on Ctrl+v / Cmd+v
         Binding::new(
@@ -2094,13 +2310,13 @@ pub static DEFAULT_BINDINGS: LazyLock<Vec<Binding>> = LazyLock::new(|| {
                 M::SUPER + KC::Char('v').into(),
             ],
             ContextVar::Always.into(),
-            KeyEventAction::PasteSystemClipboard,
+            &[KeyEventAction::PasteSystemClipboard],
         ),
         // Insert last word from previous history command on Alt+.
         Binding::new(
             &expand_variations![M::ALT + KC::Char('.').into(),],
             ContextVar::Always.into(),
-            KeyEventAction::InsertLastWordFromPrevCommand,
+            &[KeyEventAction::InsertLastWordFromPrevCommand],
         ),
         Binding::new(
             // Ctrl+/ (shows as Ctrl+7) - comment out and execute
@@ -2111,22 +2327,22 @@ pub static DEFAULT_BINDINGS: LazyLock<Vec<Binding>> = LazyLock::new(|| {
                 M::CONTROL + KC::Char('7').into(),
             ],
             ContextVar::Always.into(),
-            KeyEventAction::CommentLineSubmit,
+            &[KeyEventAction::CommentLineSubmit],
         ),
         Binding::new(
             &[M::CONTROL + KC::Char('r').into()],
             ContextVar::Always.into(),
-            KeyEventAction::RunFuzzyHistorySearch,
+            &[KeyEventAction::RunFuzzyHistorySearch],
         ),
         Binding::new(
             &expand_variations![M::ALT + KC::Char('r').into(),],
             ContextVar::Always.into(),
-            KeyEventAction::RunFuzzyCancelledHistorySearch,
+            &[KeyEventAction::RunFuzzyCancelledHistorySearch],
         ),
         Binding::new(
             &[M::CONTROL + KC::Char('l').into()],
             ContextVar::Always.into(),
-            KeyEventAction::ClearScreen,
+            &[KeyEventAction::ClearScreen],
         ),
         Binding::new(
             &[
@@ -2135,12 +2351,12 @@ pub static DEFAULT_BINDINGS: LazyLock<Vec<Binding>> = LazyLock::new(|| {
                 (M::CONTROL | M::SHIFT) + KC::Backspace.into(),
             ],
             ContextVar::Always.into(),
-            KeyEventAction::DeleteLeftUntilStartOfLine,
+            &[KeyEventAction::DeleteLeftUntilStartOfLine],
         ),
         Binding::new(
             &expand_variations![M::ALT + KC::Backspace.into()],
             ContextVar::Always.into(),
-            KeyEventAction::DeleteLeftOneWordPart,
+            &[KeyEventAction::DeleteLeftOneWordPart],
         ),
         Binding::new(
             &expand_variations![
@@ -2150,12 +2366,12 @@ pub static DEFAULT_BINDINGS: LazyLock<Vec<Binding>> = LazyLock::new(|| {
                 M::CONTROL + KC::Char('w').into(),
             ],
             ContextVar::Always.into(),
-            KeyEventAction::DeleteLeftOneWord,
+            &[KeyEventAction::DeleteLeftOneWord],
         ),
         Binding::new(
             &[KC::Backspace.into()],
             ContextVar::Always.into(),
-            KeyEventAction::DeleteLeft,
+            &[KeyEventAction::DeleteLeft],
         ),
         Binding::new(
             &[
@@ -2164,42 +2380,42 @@ pub static DEFAULT_BINDINGS: LazyLock<Vec<Binding>> = LazyLock::new(|| {
                 M::CONTROL + KC::Char('k').into(),
             ],
             ContextVar::Always.into(),
-            KeyEventAction::DeleteRightUntilEndOfLine,
+            &[KeyEventAction::DeleteRightUntilEndOfLine],
         ),
         Binding::new(
             &expand_variations![M::ALT + KC::Delete.into()],
             ContextVar::Always.into(),
-            KeyEventAction::DeleteRightOneWordPart,
+            &[KeyEventAction::DeleteRightOneWordPart],
         ),
         Binding::new(
             &expand_variations![M::CONTROL + KC::Delete.into()],
             ContextVar::Always.into(),
-            KeyEventAction::DeleteRightOneWord,
+            &[KeyEventAction::DeleteRightOneWord],
         ),
         Binding::new(
             &[KC::Delete.into()],
             ContextVar::Always.into(),
-            KeyEventAction::DeleteRight,
+            &[KeyEventAction::DeleteRight],
         ),
         Binding::new(
             &expand_variations![KC::Home.into()],
             ContextVar::PromptDirSelection.into(),
-            KeyEventAction::PromptDirMoveToStart,
+            &[KeyEventAction::PromptDirMoveToStart],
         ),
         Binding::new(
             &expand_variations![KC::End.into()],
             ContextVar::PromptDirSelection.into(),
-            KeyEventAction::PromptDirMoveToEnd,
+            &[KeyEventAction::PromptDirMoveToEnd],
         ),
         Binding::new(
             &expand_variations![M::CONTROL + KC::Left.into(), M::ALT + KC::Left.into()],
             ContextVar::PromptDirSelection.into(),
-            KeyEventAction::PromptDirMoveLeft,
+            &[KeyEventAction::PromptDirMoveLeft],
         ),
         Binding::new(
             &expand_variations![M::CONTROL + KC::Right.into(), M::ALT + KC::Right.into()],
             ContextVar::PromptDirSelection.into(),
-            KeyEventAction::PromptDirMoveRight,
+            &[KeyEventAction::PromptDirMoveRight],
         ),
         Binding::new(
             &[
@@ -2207,7 +2423,7 @@ pub static DEFAULT_BINDINGS: LazyLock<Vec<Binding>> = LazyLock::new(|| {
                 (M::SUPER | M::SHIFT) + KC::Char('a').into(),
             ],
             ContextVar::Always.into(),
-            KeyEventAction::SelectAll,
+            &[KeyEventAction::SelectAll],
         ),
         Binding::new(
             &[
@@ -2215,7 +2431,7 @@ pub static DEFAULT_BINDINGS: LazyLock<Vec<Binding>> = LazyLock::new(|| {
                 (M::SUPER | M::SHIFT) + KC::Left.into(),
             ],
             ContextVar::Always.into(),
-            KeyEventAction::MoveLeftStartOfLineExtendSelection,
+            &[KeyEventAction::MoveLeftStartOfLineExtendSelection],
         ),
         Binding::new(
             &expand_variations![
@@ -2225,17 +2441,17 @@ pub static DEFAULT_BINDINGS: LazyLock<Vec<Binding>> = LazyLock::new(|| {
                 M::SUPER + KC::Char('a').into(),
             ],
             ContextVar::Always.into(),
-            KeyEventAction::MoveLeftStartOfLine,
+            &[KeyEventAction::MoveLeftStartOfLine],
         ),
         Binding::new(
             &[(M::CONTROL | M::SHIFT) + KC::Left.into()],
             ContextVar::Always.into(),
-            KeyEventAction::MoveLeftOneWordExtendSelection,
+            &[KeyEventAction::MoveLeftOneWordExtendSelection],
         ),
         Binding::new(
             &[M::CONTROL + KC::Left.into()], // Emacs-style whitespace word-left
             ContextVar::Always.into(),
-            KeyEventAction::MoveLeftOneWord,
+            &[KeyEventAction::MoveLeftOneWord],
         ),
         Binding::new(
             &[
@@ -2243,34 +2459,34 @@ pub static DEFAULT_BINDINGS: LazyLock<Vec<Binding>> = LazyLock::new(|| {
                 (M::META | M::SHIFT) + KC::Left.into(),
             ],
             ContextVar::Always.into(),
-            KeyEventAction::MoveLeftOneWordPartExtendSelection,
+            &[KeyEventAction::MoveLeftOneWordPartExtendSelection],
         ),
         Binding::new(
             // Fine-grained word-left (stops at punctuation / path boundaries)
             &expand_variations![M::ALT + KC::Left.into()],
             ContextVar::Always.into(),
-            KeyEventAction::MoveLeftOneWordPart,
+            &[KeyEventAction::MoveLeftOneWordPart],
         ),
         Binding::new(
             &[KC::Left.into()],
             (ContextVar::CursorAtStart + !ContextVar::PromptDirSelection).into(),
-            KeyEventAction::StartPromptDirSelect,
+            &[KeyEventAction::StartPromptDirSelect],
         ),
         // PromptCwdEdit Left must appear before the Normal Left binding.
         Binding::new(
             &[KC::Left.into()],
             ContextVar::PromptDirSelection.into(),
-            KeyEventAction::PromptDirMoveLeft,
+            &[KeyEventAction::PromptDirMoveLeft],
         ),
         Binding::new(
             &[M::SHIFT + KC::Left.into()],
             ContextVar::Always.into(),
-            KeyEventAction::MoveLeftExtendSelection,
+            &[KeyEventAction::MoveLeftExtendSelection],
         ),
         Binding::new(
             &[KC::Left.into()],
             ContextVar::Always.into(),
-            KeyEventAction::MoveLeft,
+            &[KeyEventAction::MoveLeft],
         ),
         Binding::new(
             &expand_variations![KC::Right.into(), KC::End.into()],
@@ -2278,7 +2494,7 @@ pub static DEFAULT_BINDINGS: LazyLock<Vec<Binding>> = LazyLock::new(|| {
                 + ContextVar::CursorAtEnd
                 + !ContextVar::TabCompletionMultiColAvailable)
                 .into(),
-            KeyEventAction::InlineSuggestionAccept,
+            &[KeyEventAction::InlineSuggestionAccept],
         ),
         Binding::new(
             &[
@@ -2286,7 +2502,7 @@ pub static DEFAULT_BINDINGS: LazyLock<Vec<Binding>> = LazyLock::new(|| {
                 (M::SUPER | M::SHIFT) + KC::Right.into(),
             ],
             ContextVar::Always.into(),
-            KeyEventAction::MoveRightEndOfLineExtendSelection,
+            &[KeyEventAction::MoveRightEndOfLineExtendSelection],
         ),
         Binding::new(
             &expand_variations![
@@ -2296,17 +2512,17 @@ pub static DEFAULT_BINDINGS: LazyLock<Vec<Binding>> = LazyLock::new(|| {
                 M::SUPER + KC::Char('e').into(),
             ],
             ContextVar::Always.into(),
-            KeyEventAction::MoveRightEndOfLine,
+            &[KeyEventAction::MoveRightEndOfLine],
         ),
         Binding::new(
             &[(M::CONTROL | M::SHIFT) + KC::Right.into()],
             ContextVar::Always.into(),
-            KeyEventAction::MoveRightOneWordExtendSelection,
+            &[KeyEventAction::MoveRightOneWordExtendSelection],
         ),
         Binding::new(
             &[M::CONTROL + KC::Right.into()], // Emacs-style whitespace word-right
             ContextVar::Always.into(),
-            KeyEventAction::MoveRightOneWord,
+            &[KeyEventAction::MoveRightOneWord],
         ),
         Binding::new(
             &[
@@ -2314,59 +2530,59 @@ pub static DEFAULT_BINDINGS: LazyLock<Vec<Binding>> = LazyLock::new(|| {
                 (M::META | M::SHIFT) + KC::Right.into(),
             ],
             ContextVar::Always.into(),
-            KeyEventAction::MoveRightOneWordPartExtendSelection,
+            &[KeyEventAction::MoveRightOneWordPartExtendSelection],
         ),
         Binding::new(
             // Fine-grained word-right (stops at punctuation / path boundaries)
             &expand_variations![M::ALT + KC::Right.into()],
             ContextVar::Always.into(),
-            KeyEventAction::MoveRightOneWordPart,
+            &[KeyEventAction::MoveRightOneWordPart],
         ),
         // PromptCwdEdit Right must appear before the Normal Right binding.
         Binding::new(
             &[KC::Right.into()],
             ContextVar::PromptDirSelection.into(),
-            KeyEventAction::PromptDirMoveRight,
+            &[KeyEventAction::PromptDirMoveRight],
         ),
         Binding::new(
             &[M::SHIFT + KC::Right.into()],
             ContextVar::Always.into(),
-            KeyEventAction::MoveRightExtendSelection,
+            &[KeyEventAction::MoveRightExtendSelection],
         ),
         Binding::new(
             &[KC::Right.into()],
             ContextVar::Always.into(),
-            KeyEventAction::MoveRight,
+            &[KeyEventAction::MoveRight],
         ),
         Binding::new(
             &[M::SHIFT + KC::Up.into()],
             ContextVar::Always.into(),
-            KeyEventAction::MoveLineUpExtendSelection,
+            &[KeyEventAction::MoveLineUpExtendSelection],
         ),
         Binding::new(
             &[KC::Up.into()],
             (!ContextVar::CursorOnFirstLine).into(),
-            KeyEventAction::MoveLineUp,
+            &[KeyEventAction::MoveLineUp],
         ),
         Binding::new(
             &[KC::Up.into()],
             ContextVar::Always.into(),
-            KeyEventAction::PrevHistoryEntry,
+            &[KeyEventAction::PrevHistoryEntry],
         ),
         Binding::new(
             &[M::SHIFT + KC::Down.into()],
             ContextVar::Always.into(),
-            KeyEventAction::MoveLineDownExtendSelection,
+            &[KeyEventAction::MoveLineDownExtendSelection],
         ),
         Binding::new(
             &[KC::Down.into()],
             (!ContextVar::CursorOnFinalLine).into(),
-            KeyEventAction::MoveLineDown,
+            &[KeyEventAction::MoveLineDown],
         ),
         Binding::new(
             &[KC::Down.into()],
             ContextVar::Always.into(),
-            KeyEventAction::NextHistoryEntry,
+            &[KeyEventAction::NextHistoryEntry],
         ),
         Binding::new(
             &[
@@ -2376,7 +2592,7 @@ pub static DEFAULT_BINDINGS: LazyLock<Vec<Binding>> = LazyLock::new(|| {
                 (M::SUPER | M::SHIFT) + KC::Char('z').into(),
             ],
             ContextVar::Always.into(),
-            KeyEventAction::Redo,
+            &[KeyEventAction::Redo],
         ),
         Binding::new(
             &[
@@ -2384,7 +2600,7 @@ pub static DEFAULT_BINDINGS: LazyLock<Vec<Binding>> = LazyLock::new(|| {
                 M::SUPER + KC::Char('z').into(),
             ],
             ContextVar::Always.into(),
-            KeyEventAction::Undo,
+            &[KeyEventAction::Undo],
         ),
         Binding::new(
             &[
@@ -2392,7 +2608,7 @@ pub static DEFAULT_BINDINGS: LazyLock<Vec<Binding>> = LazyLock::new(|| {
                 KeyEventMatch::AnyCharAndMods(M::SHIFT),
             ],
             ContextVar::Always.into(),
-            KeyEventAction::InsertChar,
+            &[KeyEventAction::InsertChar],
         ),
     ]
 });
@@ -2567,6 +2783,60 @@ impl KeyEventMatch {
 
         match self {
             KeyEventMatch::Exact(ke) => {
+                let has_event_remap_to_ke = remappings.iter().any(|remap| {
+                    if let KeyRemap::Event { to, .. } = remap {
+                        to.code == ke.code && to.modifiers == ke.modifiers
+                    } else {
+                        false
+                    }
+                });
+
+                if has_event_remap_to_ke {
+                    let mut physical_events = Vec::new();
+
+                    // 1. Check if the logical key itself is mapped away.
+                    let mut is_mapped_away = false;
+                    for remap in remappings {
+                        match remap {
+                            KeyRemap::Event { from, .. } => {
+                                if from.code == ke.code && from.modifiers == ke.modifiers {
+                                    is_mapped_away = true;
+                                    break;
+                                }
+                            }
+                            KeyRemap::Key { from, .. } => {
+                                if *from == ke.code {
+                                    is_mapped_away = true;
+                                    break;
+                                }
+                            }
+                            KeyRemap::Modifier { from, .. } => {
+                                if ke.modifiers.contains(*from) {
+                                    is_mapped_away = true;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+
+                    if !is_mapped_away {
+                        physical_events.push(display_key_event(*ke));
+                    }
+
+                    // 2. Find any Event remappings that target this logical event.
+                    for remap in remappings {
+                        if let KeyRemap::Event { from, to } = remap {
+                            if to.code == ke.code && to.modifiers == ke.modifiers {
+                                physical_events.push(display_key_event(*from));
+                            }
+                        }
+                    }
+
+                    if !physical_events.is_empty() {
+                        return physical_events.join(" or ");
+                    }
+                }
+
                 let mut parts: Vec<String> = Vec::new();
                 push_modifiers(ke.modifiers, &mut parts);
                 match inverse_keycode_display(ke.code, remappings) {
@@ -2593,20 +2863,20 @@ const ANSI_RESET: &str = "\x1b[0m";
 
 fn key_event_a_shadows_b(a: &KeyEventMatch, b: &KeyEventMatch) -> bool {
     match (a, b) {
-        // If b contains more modifiers than a, a will shadow b.
+        // Under strict matching, key events only shadow each other if their modifiers match exactly.
         (KeyEventMatch::Exact(ea), KeyEventMatch::Exact(eb)) => {
-            ea.code == eb.code && eb.modifiers.contains(ea.modifiers)
+            ea.code == eb.code && ea.modifiers == eb.modifiers
         }
         (KeyEventMatch::AnyCharAndMods(mods_a), KeyEventMatch::AnyCharAndMods(mods_b)) => {
-            mods_b.contains(*mods_a)
+            mods_a == mods_b
         }
         // AnyCharAndMods overlaps with an Exact char pattern, but not with a
         // non-char key (e.g. Enter, Tab) since AnyCharAndMods only fires on chars.
         (KeyEventMatch::AnyCharAndMods(mods), KeyEventMatch::Exact(e)) => {
-            e.modifiers.contains(*mods) && matches!(e.code, KeyCode::Char(_))
+            e.modifiers == *mods && matches!(e.code, KeyCode::Char(_))
         }
         (KeyEventMatch::Exact(e), KeyEventMatch::AnyCharAndMods(mods)) => {
-            matches!(e.code, KeyCode::Char(_)) && mods.contains(e.modifiers)
+            matches!(e.code, KeyCode::Char(_)) && e.modifiers == *mods
         }
     }
 }
@@ -2658,17 +2928,29 @@ fn detect_binding_conflicts(user_bindings: &[Binding], remappings: &[KeyRemap]) 
                 }
                 for kem_a in &binding_a.key_events {
                     if key_event_a_shadows_b(kem_a, kem_b) {
+                        let actions_b_str = binding_b
+                            .actions
+                            .iter()
+                            .map(|a| a.display_name())
+                            .collect::<Vec<_>>()
+                            .join("+");
+                        let actions_a_str = binding_a
+                            .actions
+                            .iter()
+                            .map(|a| a.display_name())
+                            .collect::<Vec<_>>()
+                            .join("+");
                         conflicts.push(Conflict {
                             key_display: kem_b.display_with_remapping(remappings),
                             inaccessible_action: format!(
                                 "{}={}",
                                 binding_b.context.display(),
-                                binding_b.action.as_str()
+                                actions_b_str
                             ),
                             shadowing_action: format!(
                                 "{}={}",
                                 binding_a.context.display(),
-                                binding_a.action.as_str()
+                                actions_a_str
                             ),
                         });
                         break 'find_shadow;
@@ -2715,11 +2997,23 @@ pub fn print_bindings_table(
             .map(|k| k.display_with_remapping(remappings))
             .collect::<Vec<_>>()
             .join(", ");
+        let action_name = binding
+            .actions
+            .iter()
+            .map(|a| a.display_name())
+            .collect::<Vec<_>>()
+            .join("+");
+        let description = binding
+            .actions
+            .iter()
+            .map(|a| a.description())
+            .collect::<Vec<_>>()
+            .join(" + ");
         Row {
             keys,
             context: binding.context.display(),
-            action_name: binding.action.as_str().to_string(),
-            description: binding.action.description().to_string(),
+            action_name,
+            description,
         }
     };
 
@@ -2794,6 +3088,13 @@ pub fn print_bindings_table(
                         display_modifier_bit(*to)
                     );
                 }
+                KeyRemap::Event { from, to } => {
+                    println!(
+                        "  {} -> {}",
+                        display_key_event(*from),
+                        display_key_event(*to)
+                    );
+                }
             }
         }
     }
@@ -2822,6 +3123,7 @@ pub fn print_bindings_table(
 impl<'a> App<'a> {
     pub fn handle_key_event(&mut self, key: KeyEvent) {
         let _timer = crate::perf::PerfTimer::start("handle_key_event");
+        let initial_leader_time = self.leader_key_active_at;
         log::trace!("Key event: {:?}", key);
         self.right_click_popup_pos = None;
         self.right_click_copy_target = None;
@@ -2838,7 +3140,7 @@ impl<'a> App<'a> {
         // whose key matches.  We extract the action (Copy) before running it
         // so that running the action does not overlap with the immutable
         // borrow of `self.settings.keybindings`.
-        let mut matched: Option<(KeyEventAction, String)> = None;
+        let mut matched: Option<(Vec<KeyEventAction>, String)> = None;
         for binding in self
             .settings
             .keybindings
@@ -2847,14 +3149,14 @@ impl<'a> App<'a> {
             .chain(DEFAULT_BINDINGS.iter())
         {
             if binding.context.evaluate(&context_values) && binding.matches(key) {
-                matched = Some((binding.action, binding.context.display()));
+                matched = Some((binding.actions.clone(), binding.context.display()));
                 break;
             }
         }
 
-        let (context_debug, action_enum) = match matched.as_ref() {
-            Some((action, context)) => (context.clone(), *action),
-            None => ("none".to_string(), KeyEventAction::Nothing),
+        let (context_debug, action_enums) = match &matched {
+            Some((actions, context)) => (context.clone(), actions.clone()),
+            None => ("none".to_string(), vec![KeyEventAction::Nothing]),
         };
         let sequence_number = self
             .last_key
@@ -2864,23 +3166,35 @@ impl<'a> App<'a> {
             key,
             display: display_key_event(key),
             context: context_debug,
-            action: action_enum,
+            actions: action_enums,
             sequence_number,
         });
 
-        if let Some((action, _)) = matched {
-            log::trace!("Matched binding: {}", action.as_str());
-            action.run(self, key);
+        if let Some((actions, _)) = &matched {
+            for action in actions {
+                if !self.mode.is_running() {
+                    log::warn!("Ignoring other actions because mode is no longer running");
+                    break;
+                }
+                log::trace!("Matched binding: {}", action.as_str());
+                action.run(self, key);
+            }
         }
 
         if matched
             .as_ref()
-            .is_some_and(|(action, _)| *action != KeyEventAction::ToggleMouse)
+            .is_some_and(|(actions, _)| !actions.contains(&KeyEventAction::ToggleMouse))
             && self.settings.mouse_mode == MouseMode::Smart
             && self.mouse_state.is_disabled()
         {
             log::debug!("Reenabling mouse due to key event");
             self.mouse_state.enable();
+        }
+
+        // If the leader key was active before this key event, and was not refreshed or updated
+        // by a SetLeaderKey action during this key event, deactivate it now.
+        if initial_leader_time.is_some() && self.leader_key_active_at == initial_leader_time {
+            self.leader_key_active_at = None;
         }
 
         self.on_possible_buffer_change();
@@ -2940,6 +3254,27 @@ mod tests {
     #[test]
     fn test_parse_remap_unknown_fails() {
         assert!(try_parse_remap("unknownkey", "z").is_err());
+    }
+
+    #[test]
+    fn test_parse_remap_event() {
+        let r = try_parse_remap("ctrl+p", "up").unwrap();
+        assert_eq!(
+            r,
+            KeyRemap::Event {
+                from: KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL),
+                to: KeyEvent::new(KeyCode::Up, KeyModifiers::empty()),
+            }
+        );
+
+        let r2 = try_parse_remap("ctrl+n", "alt+4").unwrap();
+        assert_eq!(
+            r2,
+            KeyRemap::Event {
+                from: KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL),
+                to: KeyEvent::new(KeyCode::Char('4'), KeyModifiers::ALT),
+            }
+        );
     }
 
     // --- apply_remappings ---
@@ -3011,6 +3346,62 @@ mod tests {
         assert!(!result.modifiers.contains(KeyModifiers::CONTROL));
     }
 
+    #[test]
+    fn test_apply_remappings_event() {
+        let remappings = vec![
+            KeyRemap::Event {
+                from: KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL),
+                to: KeyEvent::new(KeyCode::Up, KeyModifiers::empty()),
+            },
+            KeyRemap::Event {
+                from: KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL),
+                to: KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()),
+            },
+            KeyRemap::Modifier {
+                from: KeyModifiers::CONTROL,
+                to: KeyModifiers::ALT,
+            },
+        ];
+
+        // 1. Ctrl+P should map to Up
+        let k1 = key_with_mods(KeyCode::Char('p'), KeyModifiers::CONTROL);
+        let r1 = apply_remappings(k1, &remappings);
+        assert_eq!(r1.code, KeyCode::Up);
+        assert_eq!(r1.modifiers, KeyModifiers::empty());
+
+        // 2. Ctrl+A should map to Esc (Event remap takes precedence over Modifier remap)
+        let k2 = key_with_mods(KeyCode::Char('a'), KeyModifiers::CONTROL);
+        let r2 = apply_remappings(k2, &remappings);
+        assert_eq!(r2.code, KeyCode::Esc);
+        assert_eq!(r2.modifiers, KeyModifiers::empty());
+
+        // 3. Ctrl+B should map to Alt+B (Modifier remap still applies to other keys)
+        let k3 = key_with_mods(KeyCode::Char('b'), KeyModifiers::CONTROL);
+        let r3 = apply_remappings(k3, &remappings);
+        assert_eq!(r3.code, KeyCode::Char('b'));
+        assert_eq!(r3.modifiers, KeyModifiers::ALT);
+    }
+
+    #[test]
+    fn test_apply_remappings_compound() {
+        let remappings = vec![
+            KeyRemap::Modifier {
+                from: KeyModifiers::CONTROL,
+                to: KeyModifiers::ALT,
+            },
+            KeyRemap::Key {
+                from: KeyCode::Char('p'),
+                to: KeyCode::Char('k'),
+            },
+        ];
+
+        // Ctrl+P should map to Alt+K (Modifier and Key remap applied simultaneously/independently)
+        let k = key_with_mods(KeyCode::Char('p'), KeyModifiers::CONTROL);
+        let r = apply_remappings(k, &remappings);
+        assert_eq!(r.code, KeyCode::Char('k'));
+        assert_eq!(r.modifiers, KeyModifiers::ALT);
+    }
+
     // --- inverse display ---
 
     #[test]
@@ -3064,6 +3455,69 @@ mod tests {
         }];
         let kem = KeyEventMatch::Exact(key(KeyCode::Enter));
         assert_eq!(kem.display_with_remapping(&remappings), "Enter");
+    }
+
+    #[test]
+    fn test_display_remapped_event_shows_alternatives() {
+        let remappings = vec![KeyRemap::Event {
+            from: KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL),
+            to: KeyEvent::new(KeyCode::Up, KeyModifiers::empty()),
+        }];
+
+        // Up is bound, Ctrl+P is mapped to Up. Physical keys should show "Up or Ctrl+P"
+        let kem = KeyEventMatch::Exact(key(KeyCode::Up));
+        assert_eq!(kem.display_with_remapping(&remappings), "Up or Ctrl+p");
+
+        // If the logical key itself is mapped away:
+        // E.g. Ctrl+P -> Up, and Up -> Down.
+        // Then Up is mapped away (so it's not a physical key option anymore).
+        // A binding on Down should show "Ctrl+P or Up" (or just the ones that target it).
+        let remappings_chain = vec![
+            KeyRemap::Event {
+                from: KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL),
+                to: KeyEvent::new(KeyCode::Up, KeyModifiers::empty()),
+            },
+            KeyRemap::Event {
+                from: KeyEvent::new(KeyCode::Up, KeyModifiers::empty()),
+                to: KeyEvent::new(KeyCode::Down, KeyModifiers::empty()),
+            },
+        ];
+        let kem_down = KeyEventMatch::Exact(key(KeyCode::Down));
+        assert_eq!(
+            kem_down.display_with_remapping(&remappings_chain),
+            "Down or Up"
+        );
+    }
+
+    #[test]
+    fn test_display_remapped_event_multiple_alternatives() {
+        let remappings = vec![
+            KeyRemap::Event {
+                from: KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL),
+                to: KeyEvent::new(KeyCode::Up, KeyModifiers::empty()),
+            },
+            KeyRemap::Event {
+                from: KeyEvent::new(KeyCode::Char('p'), KeyModifiers::ALT),
+                to: KeyEvent::new(KeyCode::Up, KeyModifiers::empty()),
+            },
+        ];
+
+        let kem = KeyEventMatch::Exact(key(KeyCode::Up));
+        // Up is bound, Ctrl+P and Alt+P are mapped to Up. Physical keys should show all options.
+        assert_eq!(
+            kem.display_with_remapping(&remappings),
+            "Up or Ctrl+p or Alt+p"
+        );
+    }
+
+    #[test]
+    fn test_print_bindings_table_with_event_remap() {
+        let remappings = vec![KeyRemap::Event {
+            from: KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL),
+            to: KeyEvent::new(KeyCode::Up, KeyModifiers::empty()),
+        }];
+        // Ensure that print_bindings_table runs with KeyRemap::Event without panic
+        print_bindings_table(&[], None, &remappings);
     }
 
     #[test]
@@ -3243,17 +3697,17 @@ mod tests {
     }
 
     #[test]
-    fn test_overlap_exact_same_key_shift_does_not_shadow_unmodified() {
+    fn test_overlap_exact_same_key_different_modifiers_no_shadow() {
         let a = KeyEventMatch::Exact(key(KeyCode::Home));
         let b = KeyEventMatch::Exact(key_with_mods(KeyCode::Home, KeyModifiers::SHIFT));
-        assert!(key_event_a_shadows_b(&a, &b));
+        assert!(!key_event_a_shadows_b(&a, &b));
     }
 
     #[test]
     fn test_overlap_anychar_and_anychar() {
         let a = KeyEventMatch::AnyCharAndMods(KeyModifiers::empty());
         let b = KeyEventMatch::AnyCharAndMods(KeyModifiers::CONTROL);
-        assert!(key_event_a_shadows_b(&a, &b));
+        assert!(!key_event_a_shadows_b(&a, &b));
     }
 
     #[test]
@@ -3268,7 +3722,7 @@ mod tests {
     fn test_overlap_anychar_and_exact_char_different_modifiers() {
         let a = KeyEventMatch::AnyCharAndMods(KeyModifiers::empty());
         let b = KeyEventMatch::Exact(key_with_mods(KeyCode::Char('q'), KeyModifiers::SHIFT));
-        assert!(key_event_a_shadows_b(&a, &b));
+        assert!(!key_event_a_shadows_b(&a, &b));
     }
 
     #[test]
@@ -3279,14 +3733,13 @@ mod tests {
         assert!(!key_event_a_shadows_b(&b, &a));
     }
 
-    // #[test]
-    // fn test_binding_matches_requires_exact_modifiers() {
-    //     let binding =
-    //         Binding::try_new(&["Home"], "always", KeyEventAction::MoveLeftStartOfLine).unwrap();
+    #[test]
+    fn test_binding_matches_requires_exact_modifiers() {
+        let binding = Binding::try_new_from_strs("Home", "always=moveLeftStartOfLine").unwrap();
 
-    //     assert!(binding.matches(key(KeyCode::Home)));
-    //     assert!(!binding.matches(key_with_mods(KeyCode::Home, KeyModifiers::SHIFT)));
-    // }
+        assert!(binding.matches(key(KeyCode::Home)));
+        assert!(!binding.matches(key_with_mods(KeyCode::Home, KeyModifiers::SHIFT)));
+    }
 
     #[test]
     fn test_context_expr_parse_single() {
@@ -3386,6 +3839,7 @@ mod tests {
             KeyEventAction::try_from("inlineSuggestionAccept").unwrap()
                 == KeyEventAction::InlineSuggestionAccept
         );
+        assert!(KeyEventAction::try_from("clearBuffer").unwrap() == KeyEventAction::ClearBuffer);
     }
 
     #[test]
@@ -3396,7 +3850,7 @@ mod tests {
     #[test]
     fn test_binding_try_new_from_strs_basic() {
         let b = Binding::try_new_from_strs("Ctrl+Enter", "always=submitOrNewline").unwrap();
-        assert!(b.action == KeyEventAction::SubmitOrNewline);
+        assert_eq!(b.actions, vec![KeyEventAction::SubmitOrNewline]);
         assert!(b.context.literals.len() == 1);
         assert!(b.context.literals[0].var == ContextVar::Always);
     }
@@ -3408,8 +3862,64 @@ mod tests {
             "inlineSuggestionAvailable+cursorAtEnd=inlineSuggestionAccept",
         )
         .unwrap();
-        assert!(b.action == KeyEventAction::InlineSuggestionAccept);
+        assert_eq!(b.actions, vec![KeyEventAction::InlineSuggestionAccept]);
         assert!(b.context.literals.len() == 2);
+    }
+
+    #[test]
+    fn test_binding_try_new_from_strs_multi_actions() {
+        let b = Binding::try_new_from_strs(
+            "Ctrl+g",
+            "always=submitOrNewline+inlineSuggestionAccept+escapeToNormalMode",
+        )
+        .unwrap();
+        assert_eq!(
+            b.actions,
+            vec![
+                KeyEventAction::SubmitOrNewline,
+                KeyEventAction::InlineSuggestionAccept,
+                KeyEventAction::EscapeToNormalMode
+            ]
+        );
+        assert!(b.context.literals.len() == 1);
+        assert!(b.context.literals[0].var == ContextVar::Always);
+    }
+
+    #[test]
+    fn test_binding_try_new_from_strs_insert_string() {
+        let b = Binding::try_new_from_strs("Ctrl+g", "always=insertString('git checkout -b ')")
+            .unwrap();
+        assert_eq!(
+            b.actions,
+            vec![KeyEventAction::InsertString("git checkout -b ".to_string())]
+        );
+
+        let b2 =
+            Binding::try_new_from_strs("Ctrl+g", "always=insertString(\"hello\\nworld\")").unwrap();
+        assert_eq!(
+            b2.actions,
+            vec![KeyEventAction::InsertString("hello\nworld".to_string())]
+        );
+
+        let b3 = Binding::try_new_from_strs("Ctrl+g", "always=insertString(hello)").unwrap();
+        assert_eq!(
+            b3.actions,
+            vec![KeyEventAction::InsertString("hello".to_string())]
+        );
+
+        let b4 = Binding::try_new_from_strs("Ctrl+g", "always=insertString('hello')").unwrap();
+        assert_eq!(
+            b4.actions,
+            vec![KeyEventAction::InsertString("hello".to_string())]
+        );
+
+        let b5 = Binding::try_new_from_strs("Ctrl+g", "always=insertString(\"hello\")").unwrap();
+        assert_eq!(
+            b5.actions,
+            vec![KeyEventAction::InsertString("hello".to_string())]
+        );
+
+        assert!(Binding::try_new_from_strs("Ctrl+g", "always=insertString(hello").is_err());
     }
 
     #[test]
@@ -3434,6 +3944,42 @@ mod tests {
     }
 
     #[test]
+    fn test_possible_context_action_completions_partial_action_yields_no_suffix() {
+        let values = possible_context_action_completions(std::ffi::OsStr::new("always=submitOr"))
+            .into_iter()
+            .map(|c| c.get_value().to_string_lossy().to_string())
+            .collect::<Vec<_>>();
+
+        assert!(values.contains(&"always=PREFIX_DELIMsubmitOrNewlineNO_SUFFIX".to_string()));
+    }
+
+    #[test]
+    fn test_possible_context_action_completions_full_action_yields_space_or_plus() {
+        let values =
+            possible_context_action_completions(std::ffi::OsStr::new("always=submitOrNewline"))
+                .into_iter()
+                .map(|c| c.get_value().to_string_lossy().to_string())
+                .collect::<Vec<_>>();
+
+        assert!(values.contains(&"always=PREFIX_DELIMsubmitOrNewline".to_string()));
+        assert!(values.contains(&"always=PREFIX_DELIMsubmitOrNewline+NO_SUFFIX".to_string()));
+    }
+
+    #[test]
+    fn test_possible_context_action_completions_multi_actions() {
+        let values = possible_context_action_completions(std::ffi::OsStr::new(
+            "always=submitOrNewline+inlineSugge",
+        ))
+        .into_iter()
+        .map(|c| c.get_value().to_string_lossy().to_string())
+        .collect::<Vec<_>>();
+
+        assert!(values.contains(
+            &"always=PREFIX_DELIMsubmitOrNewline+inlineSuggestionAcceptNO_SUFFIX".to_string()
+        ));
+    }
+
+    #[test]
     fn test_binding_try_new_from_strs_missing_equals() {
         assert!(Binding::try_new_from_strs("Tab", "alwayssubmitOrNewline").is_err());
     }
@@ -3454,6 +4000,44 @@ mod tests {
         for a in KeyEventAction::iter() {
             assert!(!a.description().is_empty());
         }
+    }
+
+    #[test]
+    fn test_binding_new_deduplicates_key_events() {
+        let events = vec![
+            KeyEventMatch::Exact(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL)),
+            KeyEventMatch::Exact(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL)),
+            KeyEventMatch::Exact(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL)),
+        ];
+        let binding = Binding::new(
+            &events,
+            ContextExpr::from(ContextVar::Always),
+            &[KeyEventAction::MoveLeftStartOfLine],
+        );
+        assert_eq!(binding.key_events.len(), 2);
+        assert_eq!(
+            binding.key_events[0],
+            KeyEventMatch::Exact(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL))
+        );
+        assert_eq!(
+            binding.key_events[1],
+            KeyEventMatch::Exact(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL))
+        );
+    }
+
+    #[test]
+    fn test_remap_key_completer() {
+        use std::ffi::OsStr;
+        // Test that key_sequence completions are included
+        let res_z = remap_key_completer(OsStr::new("z"));
+        assert!(res_z.iter().any(|c| c.get_value() == "z"));
+
+        // Test that capitalized standalone modifiers are suggested
+        let res_ct = remap_key_completer(OsStr::new("ct"));
+        assert!(res_ct.iter().any(|c| c.get_value() == "Ctrl"));
+
+        let res_al = remap_key_completer(OsStr::new("al"));
+        assert!(res_al.iter().any(|c| c.get_value() == "Alt"));
     }
 }
 
@@ -3530,6 +4114,8 @@ pub(crate) enum ContextVar {
     FuzzyHistorySearchNoneSelected,
     #[strum(message = "Agent output selection is active and no suggestion is currently selected")]
     AgentOutputNoneSelected,
+    #[strum(message = "The leader key is currently active")]
+    LeaderKeyActive,
 }
 
 impl ContextVar {
@@ -3662,6 +4248,9 @@ impl ContextVar {
                     false
                 }
             }
+            ContextVar::LeaderKeyActive => app.leader_key_active_at.map_or(false, |t| {
+                t.elapsed() < std::time::Duration::from_millis(1000)
+            }),
         }
     }
 }

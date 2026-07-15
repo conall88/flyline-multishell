@@ -558,6 +558,13 @@ flyline set-cursor --help
 ```
 
 # Terminal emulator notes
+## Kitty:
+When running inside Kitty, it is highly recommended to use the terminal cursor backend:
+```bash
+flyline set-cursor --backend terminal
+```
+By default, Flyline detects if it is running in Kitty and defaults to the `terminal` backend. Using the custom `flyline` cursor backend inside Kitty hides the terminal's native hardware cursor, which prevents Kitty from detecting shell prompts, causing it to ask for confirmation when closing the terminal window.
+
 ## VS Code:
 Recommended settings
 - [`terminal.integrated.minimumContrastRatio = 1`](vscode://settings/terminal.integrated.minimumContrastRatio) to prevent the cell's foreground colour changing when it's under the cursor.
@@ -604,6 +611,7 @@ The block below is auto-generated from `flyline --help`:
 Usage: flyline [OPTIONS] [COMMAND]
 
 Commands:
+  version               Show version information
   time                  Print a timestamp.
   set-agent-mode        Configure AI agent mode.
   create-prompt-widget  Create a custom prompt widget.
@@ -691,11 +699,11 @@ flyline set-style bash-reserved="bold yellow"
 
 ## Keybindings
 
-List all keybindings with `flyline key list`.
-Flyline allows configurable keybindings with the `flyline key bind [KEY SEQUENCE] [CONTEXT_EXPR]=[ACTION]` subcommand.
-The context expression is a `+`-separated chain of camelCase context variables (each optionally prefixed with `!` to negate).
-A binding only fires when its context expression evaluates to true.
-This allows the same key sequence to trigger different actions under different circumstances.
+Flyline allows configurable keybindings with the `flyline key bind [KEY SEQUENCE] [CONTEXT_EXPR]=[ACTIONS]` subcommand:
+- `CONTEXT_EXPR` is a `+`-separated chain of **context variables** (each optionally prefixed with `!` to negate).
+- `ACTIONS` is a `+`-separated chain of **actions**.
+- A binding only fires when its **context expression** evaluates to true.
+- This allows the same key sequence to trigger different **actions** under different circumstances.
 
 For instance:
 ```bash
@@ -707,19 +715,84 @@ If `tabCompletionAvailable` is false, then it will try the next keybinding for `
 The `always` context variable is always true.
 For tab completion, `tabCompletionOneResult` is true when there is exactly one tab completion result.
 
+Flyline provides useful tab completions to help you write keybindings.
+
+#### List keybindings
+List all keybindings with `flyline key list`.
+List bindings for a single key event with: `flyline key list Ctrl+a`
+
+#### Context expressions
 A context expression may combine multiple variables with `+`:
 ```bash
 flyline key bind Tab inlineSuggestionAvailable+cursorAtEnd=inlineSuggestionAccept
 ```
+This will only trigger when *both* `inlineSuggestionAvailable` and `cursorAtEnd` are true.
 Use `!` in front of a variable to negate it (e.g. `!textSelected`). Parentheses are not supported. 
 
-It is possible to remap keys entirely with:
+#### Multiple actions
+Multiple actions can be dispatched from a single key event:
 ```bash
-flyline key remap Alt Ctrl       # Pressing Alt now acts like pressing Ctrl
-flyline key remap Ctrl Alt       # With the above command, Alt and Ctrl are effectively swapped.
+flyline key bind Ctrl+g always=clearBuffer+prevHistoryEntry+submitOrNewLine
+
+# You can setup "macros":
+flyline key bind Ctrl+g 'always=clearBuffer+insertString(yazi)+submitOrNewline'
+
+# NB: Single quotes are needed here to avoid Bash syntax errors
+flyline key bind Ctrl+g 'always=clearBuffer+insertString(git checkout -b )'
 ```
 
-Tab completions exist for both key sequences and context/action arguments to make it easier to write keybindings.
+`clearBuffer+insertString(some command)+submitOrNewline` is a handy pattern of actions to quickly run `some command`.
+
+> [!IMPORTANT]
+> `submitOrNewline` will cause flyline to accept a well formed command.
+> Any actions after flyline accepts the buffer are dropped.
+
+#### Full key event remap
+
+It is possible to remap individual keys and full key events entirely with:
+```bash
+# Individual key
+flyline key remap Alt Ctrl       # Pressing Alt now acts like pressing Ctrl
+flyline key remap Ctrl Alt       # With the above command, Alt and Ctrl are effectively swapped
+
+# Full key event
+flyline key remap Ctrl+P Up      # Pressing Ctrl+P will trigger any keybinding that Up would trigger
+```
+
+Q: Why would you use key event remapping?
+
+A: Instead of manually duplicating multiple context-dependent bindings from `Up` to `Ctrl+P` , you can use key event remapping to redirect `Ctrl+p` to `Up`  globally.
+
+#### Leader Keys
+
+> [!CAUTION]
+> This an experimental feature and might change. Feedback welcome
+
+Flyline supports leader key sequences. A leader key sequence allows you to press a prefix key (like `Ctrl+x`), which activates a temporary leader key state (for up to 1000ms). While that state is active, you can press a subsequent key to trigger a specific binding.
+
+To set up leader key bindings:
+```bash
+# Bind the prefix key to `setLeaderKey`**:
+flyline key bind Ctrl+x always=setLeaderKey
+
+# Ctrl+x then Ctrl+f clears the buffer, inserts "git status", and runs it
+flyline key bind Ctrl+f 'leaderKeyActive=clearBuffer+insertString(git status)+submitOrNewline'
+
+# Ctrl+x then g clears buffer, then inserts "git commit -m", and consumes the leader key
+flyline key bind g 'leaderKeyActive=clearBuffer+insertString(git commit -m)+unsetLeaderKey'
+
+# Or we could set the leader key again to chain leader key lead actions:
+flyline key bind g 'leaderKeyActive=clearBuffer+insertString(git commit -m)+setLeaderKey'
+```
+
+To show a visual indicator in your prompt (e.g. `<leader>` or ` X `) when the leader key state is active, register a `leader-mode` prompt widget:
+```bash
+# This will show "LEADER" when active and nothing inactive
+flyline create-prompt-widget leader-mode --name FLYLINE_LEADER_MODE 'LEADER' ''
+
+# And include it in your `PS1`/`RPS1`/`PS1_FILL`:
+export RPS1='FLYLINE_LEADER_MODE'
+```
 
 # Licensing
 
