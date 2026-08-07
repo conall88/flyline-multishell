@@ -2,6 +2,11 @@ pub(crate) const CHANGELOG: &str = r#"# Changelog
 
 # flyline-multishell fork
 
+## v1.2.0
+- **Fish support**: Third host shell via `ShellBackend` + `flyline-standalone`, with `scripts/flyline.fish`, conf.d install (no `config.fish` edits), headless `complete --do-complete` completions, fish-dialect flycomp output under `~/.config/fish/completions/`, and Docker/CI install + integration tests.
+- **flycomp on zsh/fish**: Documented and demoed Esc → Tab path when generic file completions hide the synthesize prompt (Bash still uses Tab alone).
+- **Docs**: Multi-shell messaging, Credits for HalFrgrd/flyline upstream, Adding a shell / Demo GIFs sections.
+
 ## v1.1.1
 - a2677e4 - Register synthesized completers immediately when plugin managers defer compdef, preventing flycomp from repeatedly prompting after generation. Fixes a flycomp suggestion loop when using znap.
 
