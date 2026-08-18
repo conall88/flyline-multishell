@@ -2,6 +2,13 @@ pub(crate) const CHANGELOG: &str = r#"# Changelog
 
 # flyline-multishell fork
 
+## v1.3.0
+- **Install channels**: `FLYLINE_CHANNEL=stable|prerelease|dev` (default `stable` = GitHub `releases/latest`) and `FLYLINE_INSTALL_VERSION=<tag>` to pin. Channel env vars must be set on `sh` (for example `curl … | FLYLINE_CHANNEL=dev sh`). Development snapshots use unique `dev-YYYYMMDD-<sha>` tags and do not bump `Cargo.toml`.
+- **Atomic install**: Release files are staged, then renamed into place, so a failed install cannot leave a half-written `libflyline.so`.
+- **Bash load probe**: The installer probes `enable -f` in an interactive Bash before wiring `~/.bashrc`, and skips bashrc changes when the library cannot be loaded.
+- **Packaged library version**: The versioned `.so` suffix is taken from the unpacked archive, not leftover files in the install directory.
+- **Upstream v1.4.0**: `Char(c)` key bindings, inline viewport height, third-party tool integration, customizable PS2, Nix flake packaging, and related fixes. See the Upstream section below.
+
 ## v1.2.0
 - **Fish support**: Third host shell via `ShellBackend` + `flyline-standalone`, with `scripts/flyline.fish`, conf.d install (no `config.fish` edits), headless `complete --do-complete` completions, fish-dialect flycomp output under `~/.config/fish/completions/`, and Docker/CI install + integration tests.
 - **flycomp on zsh/fish**: Documented and demoed Esc → Tab path when generic file completions hide the synthesize prompt (Bash still uses Tab alone).
