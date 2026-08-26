@@ -1,13 +1,12 @@
 # >>> flyline start >>>
-# flyline runs as a separate process from a `fish_prompt` event handler: it
-# draws its TUI on the tty and returns the chosen line on fd 3. Fail-open — if
-# flyline is missing, cancelled, or crashes, native fish handles the line
-# unharmed.
+# On an empty native prompt, Enter launches flyline as a separate process. It
+# draws its TUI on the tty and returns the chosen line on fd 3. Running from a
+# fish key binding keeps accepted commands in the reader's normal execution
+# path, including interactive job control and terminal input.
 
 if status is-interactive; and not set -q _flyline_loaded
     set -g _flyline_loaded 1
     set -g _flyline_script (status filename)
-    set -g _flyline_pending ''
 
     # Default to flyline-standalone next to the install dir (parent of scripts/).
     if not set -q FLYLINE_BIN
@@ -32,28 +31,8 @@ if status is-interactive; and not set -q _flyline_loaded
     # renders the command line, fish loses nothing it uses.
     set -g FISH_TEST_NO_RECURRENT_QUERIES 1
 
-    # After fish_prompt returns, fish clears the commandline before the next
-    # read — so a deferred `commandline -f execute` is a no-op. Stash the
-    # accepted line and eval it from a signal handler that runs once the
-    # reader is active again (also required with queries disabled on fish 4.x).
-    function _flyline_do_execute --on-signal SIGUSR2
-        if test -n "$_flyline_pending"
-            set -l to_run $_flyline_pending
-            set -g _flyline_pending ''
-            set -e _flyline_busy
-            eval $to_run
-            commandline -f repaint
-        end
-    end
-
-    function _flyline_edit --on-event fish_prompt
-        set -l last_exit $status # capture before anything clobbers $status
-        # Skip while a deferred execute is outstanding (avoids re-entering
-        # flyline before the accepted line has run).
-        if set -q _flyline_busy
-            return 0
-        end
-        test -x "$FLYLINE_BIN"; or return 0 # fail open
+    function _flyline_edit
+        set -l last_exit $argv[1]
 
         # flyline reads history from the fish history file; flush this session's
         # first, and tell flyline which session file to read.
@@ -79,12 +58,8 @@ if status is-interactive; and not set -q _flyline_loaded
         set -l rc $pipestatus[1]
 
         if test $rc -eq 0
-            # Accept even when empty, so the prompt event re-fires and
-            # relaunches flyline (matches the zsh widget's behaviour).
-            set -g _flyline_pending $cmd
-            set -g _flyline_busy 1
-            command fish -c "sleep 0.05; kill -USR2 $fish_pid" &
-            builtin disown 2>/dev/null
+            commandline -r -- $cmd
+            commandline -f execute
         else if test $rc -eq 130
             # Ctrl-C: clear to a fresh native line for this prompt.
             commandline -r ''
@@ -95,20 +70,39 @@ if status is-interactive; and not set -q _flyline_loaded
         return 0
     end
 
+    function _flyline_enter
+        set -l last_exit $status
+        if test -n (commandline | string collect); or not test -x "$FLYLINE_BIN"
+            commandline -f execute
+            return 0
+        end
+        _flyline_edit $last_exit
+    end
+
+    # Preserve user Enter bindings so flyline_disable is reversible. Fish's
+    # preset binding remains underneath when there is no user override.
+    set -g _flyline_prev_default_enter (bind --user -M default \r 2>/dev/null | string collect)
+    set -g _flyline_prev_insert_enter (bind --user -M insert \r 2>/dev/null | string collect)
+    bind --user -M default \r _flyline_enter
+    bind --user -M insert \r _flyline_enter
+
     function flyline_enable
-        set -e _flyline_loaded
-        set -e _flyline_busy
-        set -g _flyline_pending ''
-        source $_flyline_script
+        set -l script $_flyline_script
+        flyline_disable
+        source $script
     end
 
     function flyline_disable
         functions -e _flyline_edit
-        functions -e _flyline_do_execute
+        functions -e _flyline_enter
         functions -e flyline
+        bind --erase --user -M default \r 2>/dev/null
+        bind --erase --user -M insert \r 2>/dev/null
+        test -n "$_flyline_prev_default_enter"; and eval $_flyline_prev_default_enter
+        test -n "$_flyline_prev_insert_enter"; and eval $_flyline_prev_insert_enter
         set -e _flyline_loaded
-        set -e _flyline_busy
-        set -g _flyline_pending ''
+        set -e _flyline_prev_default_enter
+        set -e _flyline_prev_insert_enter
         set -e FISH_TEST_NO_RECURRENT_QUERIES
     end
 
