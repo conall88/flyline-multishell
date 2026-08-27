@@ -151,7 +151,7 @@ flyline_uninstall   # disable flyline and unset FLYLINE_BIN in this session
 sh install.sh --uninstall   # remove conf.d/flyline.fish, flyline-standalone, and scripts/flyline.fish
 ```
 
-**Start with Enter:** at an empty fish prompt, press Enter to open flyline. If you have already typed into fish's native buffer, Enter retains its normal execute behavior. If the flyline binary is missing, fish also falls back to its native Enter binding.
+**Prompt startup:** flyline opens automatically at each fish prompt, so inline history and completion suggestions are available as you type. Accepted commands are handed back to Fish's reader before execution, preserving interactive input and job control. If the flyline binary is missing, Fish falls back to its native line editor.
 
 **Completions reuse your fish setup.** flyline asks `fish -c 'complete --do-complete=…'` for completions, so it completes exactly what your interactive fish does — including descriptions — with your config and completion files loaded. Unlike zsh, fish exposes its completion engine headlessly, so there is no persistent daemon or broker: each request is a fresh ~10–30ms `fish` call.
 
