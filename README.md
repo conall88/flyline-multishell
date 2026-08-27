@@ -151,7 +151,7 @@ flyline_uninstall   # disable flyline and unset FLYLINE_BIN in this session
 sh install.sh --uninstall   # remove conf.d/flyline.fish, flyline-standalone, and scripts/flyline.fish
 ```
 
-**Fail-open:** flyline runs as a separate process from a `fish_prompt` event handler. If the binary is missing, you cancel, or flyline crashes, fish falls back to native line editing for that line — your shell keeps working.
+**Prompt startup:** flyline opens automatically at each fish prompt, so inline history and completion suggestions are available as you type. Accepted commands are handed back to Fish's reader before execution, preserving interactive input and job control. If the flyline binary is missing, Fish falls back to its native line editor.
 
 **Completions reuse your fish setup.** flyline asks `fish -c 'complete --do-complete=…'` for completions, so it completes exactly what your interactive fish does — including descriptions — with your config and completion files loaded. Unlike zsh, fish exposes its completion engine headlessly, so there is no persistent daemon or broker: each request is a fresh ~10–30ms `fish` call.
 
@@ -164,7 +164,7 @@ sh install.sh --uninstall   # remove conf.d/flyline.fish, flyline-standalone, an
 - **History is file-mediated.** The widget runs `history save` before launching flyline, which then reads the session's history file — recent commands are visible, but this is not a live read of the parent shell's in-memory list.
 - **Variable introspection is partial.** Variable tooltips and `$VAR` completion use a per-call `fish -c`, so they see exported and universal variables but not unexported globals of the parent session.
 - **Abbreviations don't expand inline.** `abbr` expansions are shown as alias tooltips and used for completion lookup, but typing an abbreviation in flyline inserts it literally.
-- **fish's prompt-time terminal queries are disabled while flyline is on.** fish 4.x sends blocking terminal queries (cursor position, background color) around each prompt and hard-`assert!`s if one is still pending when the next is issued (`reader.rs`, `query.is_none()`) — a TUI taking the tty from a `fish_prompt` handler consumes the reply under real terminal latency and crashes fish itself (reproduced with ≥300ms reply lag; guarded by a regression test). The widget therefore sets `FISH_TEST_NO_RECURRENT_QUERIES` while enabled and clears it on `flyline_disable`. Practical cost: fish's automatic light/dark background detection pauses while flyline is active. Accepted lines execute via a signal-deferred `commandline -f execute` (with queries off, fish's reader only drains queued readline functions when woken).
+- **fish's prompt-time terminal queries are disabled while flyline is on.** fish 4.x sends blocking terminal queries (cursor position, background color) around each prompt and hard-`assert!`s if one is still pending when the next is issued (`reader.rs`, `query.is_none()`) — a TUI taking the tty consumes the reply under real terminal latency and crashes fish itself (reproduced with ≥300ms reply lag; guarded by a regression test). The integration therefore sets `FISH_TEST_NO_RECURRENT_QUERIES` while enabled and clears it on `flyline_disable`. Practical cost: fish's automatic light/dark background detection pauses while flyline is active. Flyline runs from a fish reader binding so accepted commands—including `sudo`, package managers, and password prompts—retain normal job control and terminal input.
 
 ### Arch Linux
 

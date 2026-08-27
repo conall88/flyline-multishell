@@ -23,7 +23,7 @@ passed = 0
 failed = 0
 
 
-def run_shell(env_overrides, lines, secs_per_line=1.5, reply_delay=0.0):
+def run_shell(env_overrides, lines, secs_per_line=1.5, reply_delay=0.0, pre_source=""):
     env = dict(os.environ)
     env["TERM"] = "xterm-256color"
     env["HOME"] = env.get("HOME", "/root")
@@ -31,7 +31,8 @@ def run_shell(env_overrides, lines, secs_per_line=1.5, reply_delay=0.0):
 
     pid, fd = pty.fork()
     if pid == 0:
-        os.execvpe("fish", ["fish", "-i", "-C", f"source {FLYLINE_FISH}"], env)
+        init = f"{pre_source}; source {FLYLINE_FISH}" if pre_source else f"source {FLYLINE_FISH}"
+        os.execvpe("fish", ["fish", "-i", "-C", init], env)
 
     fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 100, 0, 0))
 
@@ -101,6 +102,17 @@ out = run_shell(
 )
 check("flyline widget accepts and executes a command", "ENABLED_42", out)
 
+print("== accepted command retains interactive stdin ==")
+# Model package-manager confirmation prompts without installing anything. The
+# accepted command must run through fish's normal reader so `read` owns the tty
+# and receives the second submitted line.
+out = run_shell(
+    {"FLYLINE_BIN": FLYLINE_BIN},
+    ["sh -c 'read answer; echo INTERACTIVE_$answer'", "yes"],
+    secs_per_line=4.0,
+)
+check("accepted command can read confirmation input", "INTERACTIVE_yes", out)
+
 print("== fail-open: missing flyline binary ==")
 out = run_shell(
     {"FLYLINE_BIN": "/no/such/flyline"},
@@ -133,6 +145,14 @@ out = run_shell(
     ["flyline_disable", "echo DISABLED_(math 43 - 1)"],
 )
 check("native fish runs after flyline_disable", "DISABLED_42", out)
+
+print("== flyline preserves prior Enter binding ==")
+out = run_shell(
+    {"FLYLINE_BIN": FLYLINE_BIN},
+    ["flyline_disable", "echo BIND"],
+    pre_source="bind --user \\r 'commandline -a _RESTORED; commandline -f execute'",
+)
+check("custom Enter binding remains after disable", "BIND_RESTORED", out)
 
 print()
 print(f"RESULT: {passed} passed, {failed} failed")
