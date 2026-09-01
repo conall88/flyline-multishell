@@ -15,6 +15,10 @@ pub fn will_bash_accept_buffer(buffer: &str) -> bool {
         }
     }
 
+    if is_function_header_without_body(&tokens) {
+        return false;
+    }
+
     if let Some(last_token) = tokens
         .iter()
         .rev()
@@ -43,6 +47,93 @@ pub fn will_bash_accept_buffer(buffer: &str) -> bool {
     parser.walk_to_end();
 
     !parser.needs_more_input()
+}
+
+fn is_function_header_without_body(tokens: &[Token]) -> bool {
+    let non_trivia: Vec<&Token> = tokens
+        .iter()
+        .filter(|t| {
+            !matches!(
+                t.kind,
+                TokenKind::Whitespace(_) | TokenKind::Comment | TokenKind::Newline
+            )
+        })
+        .collect();
+
+    if non_trivia.is_empty() {
+        return false;
+    }
+
+    let is_function_keyword = |t: &Token| {
+        matches!(t.kind, TokenKind::Function)
+            || matches!(&t.kind, TokenKind::Word(w) if w == "function")
+    };
+
+    let mut hdr_end_idx = None;
+    let n = non_trivia.len();
+
+    // Check Pattern 1: `function name ()` or `function name()`
+    if n >= 4
+        && is_function_keyword(non_trivia[0])
+        && matches!(non_trivia[1].kind, TokenKind::Word(_))
+        && matches!(non_trivia[2].kind, TokenKind::LParen)
+        && matches!(non_trivia[3].kind, TokenKind::RParen)
+    {
+        hdr_end_idx = Some(3);
+    }
+    // Check Pattern 2: `function name`
+    else if n >= 2
+        && is_function_keyword(non_trivia[0])
+        && matches!(non_trivia[1].kind, TokenKind::Word(_))
+    {
+        if n >= 4
+            && matches!(non_trivia[2].kind, TokenKind::LParen)
+            && matches!(non_trivia[3].kind, TokenKind::RParen)
+        {
+            hdr_end_idx = Some(3);
+        } else {
+            hdr_end_idx = Some(1);
+        }
+    }
+    // Check Pattern 3: `name()`
+    else if n >= 3
+        && matches!(non_trivia[0].kind, TokenKind::Word(_))
+        && matches!(non_trivia[1].kind, TokenKind::LParen)
+        && matches!(non_trivia[2].kind, TokenKind::RParen)
+    {
+        let is_assignment =
+            matches!(non_trivia[0].kind, TokenKind::Word(ref name) if name.contains('='));
+        if !is_assignment {
+            hdr_end_idx = Some(2);
+        }
+    }
+
+    if let Some(end_idx) = hdr_end_idx {
+        // If nothing follows the function header, it lacks a body!
+        if end_idx == n - 1 {
+            return true;
+        }
+
+        // Check token immediately after header
+        let next_token = non_trivia[end_idx + 1];
+        if matches!(next_token.kind, TokenKind::LParen) {
+            // Function body is a subshell `( ... )`.
+            // Check if there is a matching RParen closing this subshell.
+            let mut depth = 0;
+            for t in &non_trivia[end_idx + 1..] {
+                if matches!(t.kind, TokenKind::LParen) {
+                    depth += 1;
+                } else if matches!(t.kind, TokenKind::RParen) {
+                    depth -= 1;
+                }
+            }
+            if depth > 0 {
+                return true;
+            }
+        }
+    }
+
+    false
 }
 
 #[cfg(test)]
@@ -227,6 +318,58 @@ mod tests {
     fn test_function_def() {
         assert_eq!(will_bash_accept_buffer("my_func() { echo hello"), false);
         assert_eq!(will_bash_accept_buffer("my_func() { echo hello; }"), true);
+
+        // Function definition without body expects more input
+        assert_eq!(will_bash_accept_buffer("my_func()"), false);
+        assert_eq!(will_bash_accept_buffer("my_func() "), false);
+        assert_eq!(will_bash_accept_buffer("x() ("), false);
+        assert_eq!(will_bash_accept_buffer("function my_func"), false);
+        assert_eq!(will_bash_accept_buffer("function my_func()"), false);
+        assert_eq!(will_bash_accept_buffer("function my_func ()"), false);
+
+        // Function definitions with comments after header
+        assert_eq!(will_bash_accept_buffer("my_func() # comment\n"), false);
+        assert_eq!(
+            will_bash_accept_buffer("function my_func # comment\n"),
+            false
+        );
+
+        // One-line subshell function bodies
+        assert_eq!(will_bash_accept_buffer("my_func() ( echo hello )"), true);
+        assert_eq!(
+            will_bash_accept_buffer("function my_func ( echo hello )"),
+            true
+        );
+
+        // Multiline function definitions with complete body are accepted
+        assert_eq!(
+            will_bash_accept_buffer("my_func() {\n  echo hello\n}"),
+            true
+        );
+        assert_eq!(will_bash_accept_buffer("x() (\n  echo hello\n)"), true);
+        assert_eq!(
+            will_bash_accept_buffer("function my_func {\n  echo hello\n}"),
+            true
+        );
+        assert_eq!(
+            will_bash_accept_buffer("function my_func() {\n  echo hello\n}"),
+            true
+        );
+        assert_eq!(
+            will_bash_accept_buffer("function my_func () {\n  echo hello\n}"),
+            true
+        );
+
+        // Array assignments must remain complete and not be confused with functions
+        assert_eq!(will_bash_accept_buffer("arr=()"), true);
+        assert_eq!(will_bash_accept_buffer("arr=( 1 2 3 )"), true);
+
+        // Multiline function definitions with incomplete body expect more input
+        assert_eq!(will_bash_accept_buffer("my_func() {\n  echo hello"), false);
+        assert_eq!(
+            will_bash_accept_buffer("function my_func {\n  echo hello"),
+            false
+        );
     }
 
     #[test]
@@ -334,6 +477,15 @@ mod tests {
         // `[[ ... ]]` is a real conditional expression and must be closed.
         assert_eq!(will_bash_accept_buffer("[[ 1 == 1"), false);
         assert_eq!(will_bash_accept_buffer("[[ 1 == 1 ]]"), true);
+    }
+
+    #[test]
+    fn test_array_and_argument_brackets() {
+        // `[x]` as an argument or array index should be accepted by bash immediately
+        assert_eq!(will_bash_accept_buffer("echo [x]"), true);
+        assert_eq!(will_bash_accept_buffer("echo [x"), true);
+        assert_eq!(will_bash_accept_buffer("echo ${arr[0]}"), true);
+        assert_eq!(will_bash_accept_buffer("echo $[1+1]"), true);
     }
 
     #[test]

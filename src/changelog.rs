@@ -32,6 +32,14 @@ pub(crate) const CHANGELOG: &str = r#"# Changelog
 
 # Upstream (HalFrgrd/flyline)
 
+## v1.5.0
+- **Termina Backend**: Switched terminal rendering backend to `termina` for enhanced event handling and precise UI rendering. (Skipped the extra pre-viewport `get_cursor_position()` newline insertion: a second `ESC[6n` probe hangs zsh/fish zpty hosts that never answer DSR.)
+- **Enhanced Mouse Selection & UX**: Added triple-click line selection, quad-click buffer selection, click-and-drag suggestion selection, and isolated scrolling movements.
+- **Platform & Packaging Support**: Added Android/Termux installation support, a declarative NixOS module, and Homebrew installation documentation.
+- **Binary Size & Build Optimization**: Reduced binary size by ~1.3MB by switching to `regex-lite` and improved Arch Linux LTO build options.
+- **Agent & Subprocess Stability**: Fixed `SIGCHLD` signal handler reset behavior when spawning agent command substitutions to prevent process reaping errors (`ECHILD`).
+- **Parsing & Completion Fixes**: Improved square bracket autoclosing, unterminated function acceptance, `autocd` directory path command recognition, quote space-suffix handling, and resolved `extglob` parsing issues.
+
 ## v1.4.0
 - **`Char(c)` Key Binding Syntax**: Added support for `Char(c)` / `char('c')` / `Char("c")` single-character key specifications in `flyline key bind` (e.g. `flyline key bind Char(j)`).
 - **Inline Viewport Smooth Height**: Viewport height pre-allocates to available space down to the bottom of the screen without scrolling up, eliminating viewport resize flicker when opening popups. (Skipped the extra pre-viewport `cursor::position()` newline insertion: a second `ESC[6n` probe hangs zsh/fish zpty hosts that never answer DSR.)

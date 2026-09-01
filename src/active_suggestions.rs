@@ -2075,7 +2075,7 @@ impl ActiveSuggestions {
             return None;
         }
 
-        // Try the fuzzy matcher first
+        // Try the fuzzy matcher (which includes substring fallback for long patterns)
         if let Some((score, indices)) = crate::content_utils::fuzzy_indices_with_threshold(
             &self.fuzzy_matcher,
             &sug.s,
@@ -2086,17 +2086,6 @@ impl ActiveSuggestions {
                 score,
                 suggestion_idx: idx,
                 matching_indices: indices,
-            });
-        }
-
-        const MAX_PATTERN_LENGTH: usize = 64;
-        // I've noticed that when the pattern is very long, arinae matcher returns None.
-        // So here we force it to return a dummy match.
-        if pattern.len() > MAX_PATTERN_LENGTH {
-            return Some(FilteredItem {
-                score: 0,
-                suggestion_idx: idx,
-                matching_indices: Vec::new(),
             });
         }
 

@@ -3,8 +3,10 @@ use crate::app::{App, AppRunningState, ContentMode, ExitState, FlycompPromptSele
 use crate::content_builder::Tag;
 use crate::mouse_state::{ClickCount, PointerShape};
 use crate::settings::MouseMode;
-use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use std::sync::LazyLock;
+use termina::event::{
+    KeyCode, KeyEvent, Modifiers as KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RedrawUrgency {
@@ -164,9 +166,11 @@ pub enum MouseContextVar {
     SingleClick,
     DoubleClick,
     TripleClick,
-    PointerShapeEnabled,
+    QuadClick,
     DragStartCommand,
+    DragStartPointerTarget,
     IsPointerTarget,
+    IsMouseScrolling,
 }
 
 impl super::ContextVar for MouseContextVar {
@@ -280,43 +284,66 @@ impl super::ContextVar for MouseContextVar {
             MouseContextVar::SingleClick => app.mouse_state.get_click_count() == ClickCount::Single,
             MouseContextVar::DoubleClick => app.mouse_state.get_click_count() == ClickCount::Double,
             MouseContextVar::TripleClick => app.mouse_state.get_click_count() == ClickCount::Triple,
-            MouseContextVar::PointerShapeEnabled => app.settings.mouse_mode != MouseMode::Disabled,
+            MouseContextVar::QuadClick => app.mouse_state.get_click_count() == ClickCount::Quad,
             MouseContextVar::DragStartCommand => {
                 matches!(app.mouse_state.drag_start_tag, Some(Tag::Command(_)))
             }
-            MouseContextVar::IsPointerTarget => {
-                let hovered_tag = app.mouse_state.last_mouse_over_cell_direct;
-                hovered_tag.is_some_and(|tag| {
-                    matches!(
-                        tag,
-                        Tag::Suggestion(_)
-                            | Tag::HistoryResult(_)
-                            | Tag::AiResult(_)
-                            | Tag::TutorialPrev
-                            | Tag::TutorialNext
-                            | Tag::PromptCopyBufferWidget
-                            | Tag::Clipboard(_)
-                            | Tag::PromptCwdWidget(_)
-                            | Tag::TabCompletionScrollBar { .. }
-                            | Tag::FlycompSandboxInfo
-                            | Tag::FlycompInfo
-                            | Tag::RightClickCopy
-                            | Tag::RightClickCut
-                            | Tag::RightClickPaste
-                            | Tag::RightClickUndo
-                            | Tag::RightClickRedo
-                            | Tag::RightClickRunTutorial
-                            | Tag::FlycompYes
-                            | Tag::FlycompNo
-                            | Tag::FlycompDontAsk
-                    )
-                })
-            }
+            MouseContextVar::DragStartPointerTarget => is_pointer_target_tag(
+                app.mouse_state.drag_start_tag,
+                app.right_click_popup_pos.is_some(),
+            ),
+            MouseContextVar::IsPointerTarget => is_pointer_target_tag(
+                app.mouse_state.last_mouse_over_cell_direct,
+                app.right_click_popup_pos.is_some(),
+            ),
+            MouseContextVar::IsMouseScrolling => app.mouse_state.is_mouse_scrolling(),
         }
     }
 
     fn display(&self) -> String {
         format!("{:?}", self)
+    }
+}
+
+fn is_pointer_target_tag(tag: Option<Tag>, right_click_popup_active: bool) -> bool {
+    if right_click_popup_active {
+        tag.is_some_and(|t| {
+            matches!(
+                t,
+                Tag::RightClickCopy
+                    | Tag::RightClickCut
+                    | Tag::RightClickPaste
+                    | Tag::RightClickUndo
+                    | Tag::RightClickRedo
+                    | Tag::RightClickRunTutorial
+            )
+        })
+    } else {
+        tag.is_some_and(|t| {
+            matches!(
+                t,
+                Tag::Suggestion(_)
+                    | Tag::HistoryResult(_)
+                    | Tag::AiResult(_)
+                    | Tag::TutorialPrev
+                    | Tag::TutorialNext
+                    | Tag::PromptCopyBufferWidget
+                    | Tag::Clipboard(_)
+                    | Tag::PromptCwdWidget(_)
+                    | Tag::TabCompletionScrollBar { .. }
+                    | Tag::FlycompSandboxInfo
+                    | Tag::FlycompInfo
+                    | Tag::RightClickCopy
+                    | Tag::RightClickCut
+                    | Tag::RightClickPaste
+                    | Tag::RightClickUndo
+                    | Tag::RightClickRedo
+                    | Tag::RightClickRunTutorial
+                    | Tag::FlycompYes
+                    | Tag::FlycompNo
+                    | Tag::FlycompDontAsk
+            )
+        })
     }
 }
 
@@ -341,9 +368,9 @@ where
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MouseEventAction {
-    CopySelection,
-    CutSelection,
-    PasteSelection,
+    Copy,
+    Cut,
+    Paste,
     Undo,
     Redo,
     RunTutorial,
@@ -359,9 +386,11 @@ pub enum MouseEventAction {
     ClickCommand,
     ReleaseCommand,
     SelectWord,
+    SelectLine,
     SelectAll,
     DragCommand,
     DragWord,
+    DragLine,
     DragAll,
     ClickTutorialPrev,
     ClickTutorialNext,
@@ -386,332 +415,425 @@ pub enum MouseEventAction {
     SetPointer(PointerShape),
 }
 
+#[derive(Debug, Clone)]
 pub struct MouseBinding {
     pub(crate) context: super::ContextExpr<MouseContextVar>,
-    pub(crate) action: MouseEventAction,
+    pub(crate) actions: Vec<MouseEventAction>,
+}
+
+impl MouseBinding {
+    pub fn new(context: super::ContextExpr<MouseContextVar>, actions: &[MouseEventAction]) -> Self {
+        Self {
+            context,
+            actions: actions.to_vec(),
+        }
+    }
 }
 
 pub static DEFAULT_MOUSE_BINDINGS: LazyLock<Vec<MouseBinding>> = LazyLock::new(|| {
     vec![
+        // Highest Priority: Right click popup dismissal on click / scroll outside
+        MouseBinding::new(
+            MouseContextVar::RightClickPopupActive
+                + MouseContextVar::LeftButtonClickedUp
+                + !MouseContextVar::OverCellSemantically(TagPattern::RightClickMenu),
+            &[MouseEventAction::RightClickMenuDismiss],
+        ),
+        MouseBinding::new(
+            MouseContextVar::RightClickPopupActive + MouseContextVar::RightReleaseDismiss,
+            &[MouseEventAction::RightClickMenuDismiss],
+        ),
+        MouseBinding::new(
+            MouseContextVar::RightClickPopupActive
+                + MouseContextVar::ScrollUp
+                + !MouseContextVar::OverCellSemantically(TagPattern::RightClickMenu),
+            &[MouseEventAction::RightClickMenuDismiss],
+        ),
+        MouseBinding::new(
+            MouseContextVar::RightClickPopupActive
+                + MouseContextVar::ScrollDown
+                + !MouseContextVar::OverCellSemantically(TagPattern::RightClickMenu),
+            &[MouseEventAction::RightClickMenuDismiss],
+        ),
         // Right click menu popup opening
-        MouseBinding {
-            context: MouseContextVar::RightButtonClickedDown
+        MouseBinding::new(
+            MouseContextVar::RightButtonClickedDown
                 + !MouseContextVar::OverCellSemantically(TagPattern::RightClickMenu),
-            action: MouseEventAction::RightClickMenuOpen,
-        },
-        // Right click menu popup dismissal on release scroll/click outside
-        MouseBinding {
-            context: MouseContextVar::RightClickPopupActive + MouseContextVar::RightReleaseDismiss,
-            action: MouseEventAction::RightClickMenuDismiss,
-        },
-        MouseBinding {
-            context: MouseContextVar::RightClickPopupActive
-                + MouseContextVar::LeftButtonClickedDown
-                + !MouseContextVar::OverCellSemantically(TagPattern::RightClickMenu),
-            action: MouseEventAction::RightClickMenuDismiss,
-        },
-        MouseBinding {
-            context: MouseContextVar::RightClickPopupActive
-                + MouseContextVar::ScrollUp
-                + !MouseContextVar::OverCellSemantically(TagPattern::RightClickMenu),
-            action: MouseEventAction::RightClickMenuDismiss,
-        },
-        MouseBinding {
-            context: MouseContextVar::RightClickPopupActive
-                + MouseContextVar::ScrollDown
-                + !MouseContextVar::OverCellSemantically(TagPattern::RightClickMenu),
-            action: MouseEventAction::RightClickMenuDismiss,
-        },
+            &[
+                MouseEventAction::HoverSuggestion,
+                MouseEventAction::HoverHistoryResult,
+                MouseEventAction::HoverAiResult,
+                MouseEventAction::HoverCommand,
+                MouseEventAction::RightClickMenuOpen,
+            ],
+        ),
         // Right click menu options (activated by Left Click Release / Up)
-        MouseBinding {
-            context: MouseContextVar::LeftButtonClickedUp
+        MouseBinding::new(
+            MouseContextVar::LeftButtonClickedUp
                 + MouseContextVar::OverCellSemantically(TagPattern::RightClickCopy),
-            action: MouseEventAction::CopySelection,
-        },
-        MouseBinding {
-            context: MouseContextVar::LeftButtonClickedUp
+            &[MouseEventAction::Copy],
+        ),
+        MouseBinding::new(
+            MouseContextVar::LeftButtonClickedUp
                 + MouseContextVar::OverCellSemantically(TagPattern::RightClickCut),
-            action: MouseEventAction::CutSelection,
-        },
-        MouseBinding {
-            context: MouseContextVar::LeftButtonClickedUp
+            &[MouseEventAction::Cut],
+        ),
+        MouseBinding::new(
+            MouseContextVar::LeftButtonClickedUp
                 + MouseContextVar::OverCellSemantically(TagPattern::RightClickPaste),
-            action: MouseEventAction::PasteSelection,
-        },
-        MouseBinding {
-            context: MouseContextVar::LeftButtonClickedUp
+            &[MouseEventAction::Paste],
+        ),
+        MouseBinding::new(
+            MouseContextVar::LeftButtonClickedUp
                 + MouseContextVar::OverCellSemantically(TagPattern::RightClickUndo),
-            action: MouseEventAction::Undo,
-        },
-        MouseBinding {
-            context: MouseContextVar::LeftButtonClickedUp
+            &[MouseEventAction::Undo],
+        ),
+        MouseBinding::new(
+            MouseContextVar::LeftButtonClickedUp
                 + MouseContextVar::OverCellSemantically(TagPattern::RightClickRedo),
-            action: MouseEventAction::Redo,
-        },
-        MouseBinding {
-            context: MouseContextVar::LeftButtonClickedUp
+            &[MouseEventAction::Redo],
+        ),
+        MouseBinding::new(
+            MouseContextVar::LeftButtonClickedUp
                 + MouseContextVar::OverCellSemantically(TagPattern::RightClickRunTutorial),
-            action: MouseEventAction::RunTutorial,
-        },
+            &[MouseEventAction::RunTutorial],
+        ),
         // Scrolling in suggestions
-        MouseBinding {
-            context: MouseContextVar::TabCompletion
+        MouseBinding::new(
+            MouseContextVar::TabCompletion
                 + MouseContextVar::ScrollUp
                 + MouseContextVar::IsOverSuggestions,
-            action: MouseEventAction::ScrollSuggestionsUp,
-        },
-        MouseBinding {
-            context: MouseContextVar::TabCompletion
+            &[MouseEventAction::ScrollSuggestionsUp],
+        ),
+        MouseBinding::new(
+            MouseContextVar::TabCompletion
                 + MouseContextVar::ScrollDown
                 + MouseContextVar::IsOverSuggestions,
-            action: MouseEventAction::ScrollSuggestionsDown,
-        },
-        MouseBinding {
-            context: MouseContextVar::TabCompletion
+            &[MouseEventAction::ScrollSuggestionsDown],
+        ),
+        MouseBinding::new(
+            MouseContextVar::TabCompletion
                 + MouseContextVar::ScrollLeft
                 + MouseContextVar::IsOverSuggestions,
-            action: MouseEventAction::ScrollSuggestionsLeft,
-        },
-        MouseBinding {
-            context: MouseContextVar::TabCompletion
+            &[MouseEventAction::ScrollSuggestionsLeft],
+        ),
+        MouseBinding::new(
+            MouseContextVar::TabCompletion
                 + MouseContextVar::ScrollRight
                 + MouseContextVar::IsOverSuggestions,
-            action: MouseEventAction::ScrollSuggestionsRight,
-        },
+            &[MouseEventAction::ScrollSuggestionsRight],
+        ),
         // Scrollbar Dragging
-        MouseBinding {
-            context: MouseContextVar::TabCompletion + MouseContextVar::ScrollBarDrag,
-            action: MouseEventAction::ScrollSuggestionsBar,
-        },
+        MouseBinding::new(
+            MouseContextVar::TabCompletion + MouseContextVar::ScrollBarDrag,
+            &[MouseEventAction::ScrollSuggestionsBar],
+        ),
         // Scrolling in history
-        MouseBinding {
-            context: MouseContextVar::FuzzyHistorySearch
+        MouseBinding::new(
+            MouseContextVar::FuzzyHistorySearch
                 + MouseContextVar::ScrollUp
                 + MouseContextVar::IsOverFuzzyHistory,
-            action: MouseEventAction::ScrollHistoryUp,
-        },
-        MouseBinding {
-            context: MouseContextVar::FuzzyHistorySearch
+            &[MouseEventAction::ScrollHistoryUp],
+        ),
+        MouseBinding::new(
+            MouseContextVar::FuzzyHistorySearch
                 + MouseContextVar::ScrollDown
                 + MouseContextVar::IsOverFuzzyHistory,
-            action: MouseEventAction::ScrollHistoryDown,
-        },
+            &[MouseEventAction::ScrollHistoryDown],
+        ),
         // Directory selection hover protection (prevents dismissal when hovering select widgets)
-        MouseBinding {
-            context: MouseContextVar::PromptDirSelection
+        MouseBinding::new(
+            MouseContextVar::PromptDirSelection
                 + MouseContextVar::Moved
+                + !MouseContextVar::RightClickPopupActive
                 + MouseContextVar::OverCellSemantically(TagPattern::Ps1PromptCwd),
-            action: MouseEventAction::HoverClearTooltip,
-        },
-        MouseBinding {
-            context: MouseContextVar::PromptDirSelection
+            &[MouseEventAction::HoverClearTooltip],
+        ),
+        MouseBinding::new(
+            MouseContextVar::PromptDirSelection
                 + MouseContextVar::Moved
+                + !MouseContextVar::RightClickPopupActive
                 + MouseContextVar::OverCellSemantically(TagPattern::PromptCopyBuffer),
-            action: MouseEventAction::HoverClearTooltip,
-        },
-        MouseBinding {
-            context: MouseContextVar::PromptDirSelection
+            &[MouseEventAction::HoverClearTooltip],
+        ),
+        MouseBinding::new(
+            MouseContextVar::PromptDirSelection
                 + MouseContextVar::Moved
+                + !MouseContextVar::RightClickPopupActive
                 + !MouseContextVar::OverCellSemantically(TagPattern::Ps1PromptCwd)
                 + !MouseContextVar::OverCellSemantically(TagPattern::PromptCopyBuffer),
-            action: MouseEventAction::PromptDirSelectDismiss,
-        },
+            &[MouseEventAction::PromptDirSelectDismiss],
+        ),
         // Flycomp ask prompt
-        MouseBinding {
-            context: MouseContextVar::TabCompletionAskForFlycomp
+        MouseBinding::new(
+            MouseContextVar::TabCompletionAskForFlycomp
                 + MouseContextVar::OverCellSemantically(TagPattern::FlycompYes),
-            action: MouseEventAction::FlycompSelectYes,
-        },
-        MouseBinding {
-            context: MouseContextVar::TabCompletionAskForFlycomp
+            &[MouseEventAction::FlycompSelectYes],
+        ),
+        MouseBinding::new(
+            MouseContextVar::TabCompletionAskForFlycomp
                 + MouseContextVar::OverCellSemantically(TagPattern::FlycompNo),
-            action: MouseEventAction::FlycompSelectNo,
-        },
-        MouseBinding {
-            context: MouseContextVar::TabCompletionAskForFlycomp
+            &[MouseEventAction::FlycompSelectNo],
+        ),
+        MouseBinding::new(
+            MouseContextVar::TabCompletionAskForFlycomp
                 + MouseContextVar::OverCellSemantically(TagPattern::FlycompShowFiles),
-            action: MouseEventAction::FlycompSelectShowFiles,
-        },
-        MouseBinding {
-            context: MouseContextVar::TabCompletionAskForFlycomp
+            &[MouseEventAction::FlycompSelectShowFiles],
+        ),
+        MouseBinding::new(
+            MouseContextVar::TabCompletionAskForFlycomp
                 + MouseContextVar::OverCellSemantically(TagPattern::FlycompDontAsk),
-            action: MouseEventAction::FlycompSelectDontAsk,
-        },
-        // Hovering selection updates
-        MouseBinding {
-            context: MouseContextVar::TabCompletion
+            &[MouseEventAction::FlycompSelectDontAsk],
+        ),
+        // Hovering / clicking selection updates
+        MouseBinding::new(
+            MouseContextVar::TabCompletion
                 + MouseContextVar::Moved
+                + !MouseContextVar::RightClickPopupActive
+                + !MouseContextVar::IsMouseScrolling
                 + MouseContextVar::OverCellSemantically(TagPattern::Suggestion),
-            action: MouseEventAction::HoverSuggestion,
-        },
-        MouseBinding {
-            context: MouseContextVar::FuzzyHistorySearch
+            &[MouseEventAction::HoverSuggestion],
+        ),
+        MouseBinding::new(
+            MouseContextVar::TabCompletion
+                + MouseContextVar::DragLeft
+                + !MouseContextVar::RightClickPopupActive
+                + !MouseContextVar::IsMouseScrolling
+                + MouseContextVar::OverCellSemantically(TagPattern::Suggestion),
+            &[MouseEventAction::HoverSuggestion],
+        ),
+        MouseBinding::new(
+            MouseContextVar::TabCompletion
+                + MouseContextVar::LeftButtonClickedDown
+                + !MouseContextVar::RightClickPopupActive
+                + !MouseContextVar::IsMouseScrolling
+                + MouseContextVar::OverCellSemantically(TagPattern::Suggestion),
+            &[MouseEventAction::HoverSuggestion],
+        ),
+        MouseBinding::new(
+            MouseContextVar::FuzzyHistorySearch
                 + MouseContextVar::Moved
+                + !MouseContextVar::RightClickPopupActive
+                + !MouseContextVar::IsMouseScrolling
                 + MouseContextVar::OverCellSemantically(TagPattern::HistoryResult),
-            action: MouseEventAction::HoverHistoryResult,
-        },
-        MouseBinding {
-            context: MouseContextVar::AgentOutputSelection
+            &[MouseEventAction::HoverHistoryResult],
+        ),
+        MouseBinding::new(
+            MouseContextVar::FuzzyHistorySearch
+                + MouseContextVar::DragLeft
+                + !MouseContextVar::RightClickPopupActive
+                + !MouseContextVar::IsMouseScrolling
+                + MouseContextVar::OverCellSemantically(TagPattern::HistoryResult),
+            &[MouseEventAction::HoverHistoryResult],
+        ),
+        MouseBinding::new(
+            MouseContextVar::FuzzyHistorySearch
+                + MouseContextVar::LeftButtonClickedDown
+                + !MouseContextVar::RightClickPopupActive
+                + !MouseContextVar::IsMouseScrolling
+                + MouseContextVar::OverCellSemantically(TagPattern::HistoryResult),
+            &[MouseEventAction::HoverHistoryResult],
+        ),
+        MouseBinding::new(
+            MouseContextVar::AgentOutputSelection
                 + MouseContextVar::Moved
+                + !MouseContextVar::RightClickPopupActive
+                + !MouseContextVar::IsMouseScrolling
                 + MouseContextVar::OverCellSemantically(TagPattern::AiResult),
-            action: MouseEventAction::HoverAiResult,
-        },
-        MouseBinding {
-            context: MouseContextVar::Moved
+            &[MouseEventAction::HoverAiResult],
+        ),
+        MouseBinding::new(
+            MouseContextVar::AgentOutputSelection
+                + MouseContextVar::DragLeft
+                + !MouseContextVar::RightClickPopupActive
+                + !MouseContextVar::IsMouseScrolling
+                + MouseContextVar::OverCellSemantically(TagPattern::AiResult),
+            &[MouseEventAction::HoverAiResult],
+        ),
+        MouseBinding::new(
+            MouseContextVar::AgentOutputSelection
+                + MouseContextVar::LeftButtonClickedDown
+                + !MouseContextVar::RightClickPopupActive
+                + !MouseContextVar::IsMouseScrolling
+                + MouseContextVar::OverCellSemantically(TagPattern::AiResult),
+            &[MouseEventAction::HoverAiResult],
+        ),
+        MouseBinding::new(
+            MouseContextVar::Moved
+                + !MouseContextVar::RightClickPopupActive
                 + MouseContextVar::OverCellSemantically(TagPattern::Command),
-            action: MouseEventAction::HoverCommand,
-        },
-        MouseBinding {
-            context: MouseContextVar::Moved
+            &[MouseEventAction::HoverCommand],
+        ),
+        MouseBinding::new(
+            MouseContextVar::Moved
+                + !MouseContextVar::RightClickPopupActive
                 + !MouseContextVar::OverCellSemantically(TagPattern::Command),
-            action: MouseEventAction::HoverClearTooltip,
-        },
+            &[MouseEventAction::HoverClearTooltip],
+        ),
         // Selecting/Accepting options
-        MouseBinding {
-            context: MouseContextVar::TabCompletion
+        MouseBinding::new(
+            MouseContextVar::TabCompletion
                 + MouseContextVar::LeftButtonClickedUp
                 + MouseContextVar::OverCellSemantically(TagPattern::Suggestion),
-            action: MouseEventAction::AcceptSuggestion,
-        },
-        MouseBinding {
-            context: MouseContextVar::FuzzyHistorySearch
+            &[MouseEventAction::AcceptSuggestion],
+        ),
+        MouseBinding::new(
+            MouseContextVar::FuzzyHistorySearch
                 + MouseContextVar::LeftButtonClickedUp
                 + MouseContextVar::OverCellSemantically(TagPattern::HistoryResult),
-            action: MouseEventAction::AcceptHistoryResult,
-        },
-        MouseBinding {
-            context: MouseContextVar::AgentOutputSelection
+            &[MouseEventAction::AcceptHistoryResult],
+        ),
+        MouseBinding::new(
+            MouseContextVar::AgentOutputSelection
                 + MouseContextVar::LeftButtonClickedUp
                 + MouseContextVar::OverCellSemantically(TagPattern::AiResult),
-            action: MouseEventAction::AcceptAiResult,
-        },
+            &[MouseEventAction::AcceptAiResult],
+        ),
         // Command clicking (single, double, triple clicks)
-        MouseBinding {
-            context: MouseContextVar::LeftButtonClickedDown
+        MouseBinding::new(
+            MouseContextVar::LeftButtonClickedDown
                 + MouseContextVar::SingleClick
                 + MouseContextVar::OverCellSemantically(TagPattern::Command),
-            action: MouseEventAction::ClickCommand,
-        },
-        MouseBinding {
-            context: MouseContextVar::LeftButtonClickedDown
+            &[
+                MouseEventAction::RightClickMenuDismiss,
+                MouseEventAction::ClickCommand,
+            ],
+        ),
+        MouseBinding::new(
+            MouseContextVar::LeftButtonClickedDown
                 + MouseContextVar::DoubleClick
                 + MouseContextVar::OverCellSemantically(TagPattern::Command),
-            action: MouseEventAction::SelectWord,
-        },
-        MouseBinding {
-            context: MouseContextVar::LeftButtonClickedDown
+            &[
+                MouseEventAction::RightClickMenuDismiss,
+                MouseEventAction::SelectWord,
+            ],
+        ),
+        MouseBinding::new(
+            MouseContextVar::LeftButtonClickedDown
                 + MouseContextVar::TripleClick
                 + MouseContextVar::OverCellSemantically(TagPattern::Command),
-            action: MouseEventAction::SelectAll,
-        },
-        MouseBinding {
-            context: MouseContextVar::LeftButtonClickedUp
+            &[
+                MouseEventAction::RightClickMenuDismiss,
+                MouseEventAction::SelectLine,
+            ],
+        ),
+        MouseBinding::new(
+            MouseContextVar::LeftButtonClickedDown
+                + MouseContextVar::QuadClick
                 + MouseContextVar::OverCellSemantically(TagPattern::Command),
-            action: MouseEventAction::ReleaseCommand,
-        },
+            &[
+                MouseEventAction::RightClickMenuDismiss,
+                MouseEventAction::SelectAll,
+            ],
+        ),
+        MouseBinding::new(
+            MouseContextVar::LeftButtonClickedUp
+                + MouseContextVar::OverCellSemantically(TagPattern::Command),
+            &[MouseEventAction::ReleaseCommand],
+        ),
         // Command dragging
-        MouseBinding {
-            context: MouseContextVar::DragLeft
+        MouseBinding::new(
+            MouseContextVar::DragLeft
                 + MouseContextVar::SingleClick
                 + MouseContextVar::OverCellSemantically(TagPattern::Command),
-            action: MouseEventAction::DragCommand,
-        },
-        MouseBinding {
-            context: MouseContextVar::DragLeft
+            &[
+                MouseEventAction::RightClickMenuDismiss,
+                MouseEventAction::DragCommand,
+            ],
+        ),
+        MouseBinding::new(
+            MouseContextVar::DragLeft
                 + MouseContextVar::DoubleClick
                 + MouseContextVar::OverCellSemantically(TagPattern::Command),
-            action: MouseEventAction::DragWord,
-        },
-        MouseBinding {
-            context: MouseContextVar::DragLeft
+            &[MouseEventAction::DragWord],
+        ),
+        MouseBinding::new(
+            MouseContextVar::DragLeft
                 + MouseContextVar::TripleClick
                 + MouseContextVar::OverCellSemantically(TagPattern::Command),
-            action: MouseEventAction::DragAll,
-        },
+            &[MouseEventAction::DragLine],
+        ),
+        MouseBinding::new(
+            MouseContextVar::DragLeft
+                + MouseContextVar::QuadClick
+                + MouseContextVar::OverCellSemantically(TagPattern::Command),
+            &[MouseEventAction::DragAll],
+        ),
         // Tutorial
-        MouseBinding {
-            context: MouseContextVar::LeftButtonClickedUp
+        MouseBinding::new(
+            MouseContextVar::LeftButtonClickedUp
                 + MouseContextVar::OverCellSemantically(TagPattern::TutorialPrev),
-            action: MouseEventAction::ClickTutorialPrev,
-        },
-        MouseBinding {
-            context: MouseContextVar::LeftButtonClickedUp
+            &[MouseEventAction::ClickTutorialPrev],
+        ),
+        MouseBinding::new(
+            MouseContextVar::LeftButtonClickedUp
                 + MouseContextVar::OverCellSemantically(TagPattern::TutorialNext),
-            action: MouseEventAction::ClickTutorialNext,
-        },
+            &[MouseEventAction::ClickTutorialNext],
+        ),
         // Ps1 Cwd Click / Accept
-        MouseBinding {
-            context: MouseContextVar::PromptDirSelection
+        MouseBinding::new(
+            MouseContextVar::PromptDirSelection
                 + MouseContextVar::LeftButtonClickedUp
                 + MouseContextVar::OverCellSemantically(TagPattern::Ps1PromptCwd),
-            action: MouseEventAction::PromptDirAccept,
-        },
-        MouseBinding {
-            context: MouseContextVar::LeftButtonClickedDown
+            &[MouseEventAction::PromptDirAccept],
+        ),
+        MouseBinding::new(
+            MouseContextVar::LeftButtonClickedDown
                 + MouseContextVar::OverCellSemantically(TagPattern::Ps1PromptCwd),
-            action: MouseEventAction::PromptDirSelect,
-        },
-        MouseBinding {
-            context: MouseContextVar::DragLeft
+            &[MouseEventAction::PromptDirSelect],
+        ),
+        MouseBinding::new(
+            MouseContextVar::DragLeft
                 + MouseContextVar::OverCellSemantically(TagPattern::Ps1PromptCwd),
-            action: MouseEventAction::PromptDirSelect,
-        },
+            &[MouseEventAction::PromptDirSelect],
+        ),
         // Clipboard
-        MouseBinding {
-            context: MouseContextVar::LeftButtonClickedUp
+        MouseBinding::new(
+            MouseContextVar::LeftButtonClickedUp
                 + MouseContextVar::OverCellSemantically(TagPattern::Clipboard),
-            action: MouseEventAction::ClickClipboard,
-        },
-        MouseBinding {
-            context: MouseContextVar::LeftButtonClickedUp
+            &[MouseEventAction::ClickClipboard],
+        ),
+        MouseBinding::new(
+            MouseContextVar::LeftButtonClickedUp
                 + MouseContextVar::OverCellSemantically(TagPattern::PromptCopyBuffer),
-            action: MouseEventAction::ClickPromptCopyBuffer,
-        },
+            &[MouseEventAction::ClickPromptCopyBuffer],
+        ),
         // Smart mode viewport click or scroll -> Disable mouse capture
-        MouseBinding {
-            context: ContextExpr::from(MouseContextVar::SmartModeScroll),
-            action: MouseEventAction::DisableMouseCapture,
-        },
-        MouseBinding {
-            context: ContextExpr::from(MouseContextVar::SmartModeClickAboveViewport),
-            action: MouseEventAction::DisableMouseCapture,
-        },
-        // Pointer shape updating at the end of the matching sequence
-        MouseBinding {
-            context: ContextExpr::from(!MouseContextVar::PointerShapeEnabled),
-            action: MouseEventAction::SetPointer(PointerShape::Default),
-        },
-        MouseBinding {
-            context: MouseContextVar::PointerShapeEnabled
-                + MouseContextVar::LeftButtonIsDown
-                + !MouseContextVar::DragStartCommand,
-            action: MouseEventAction::SetPointer(PointerShape::Grabbing),
-        },
-        MouseBinding {
-            context: MouseContextVar::PointerShapeEnabled
-                + !MouseContextVar::LeftButtonIsDown
-                + MouseContextVar::OverCellDirectly(TagPattern::Command),
-            action: MouseEventAction::SetPointer(PointerShape::Text),
-        },
-        MouseBinding {
-            context: MouseContextVar::PointerShapeEnabled
-                + MouseContextVar::LeftButtonIsDown
-                + MouseContextVar::DragStartCommand,
-            action: MouseEventAction::SetPointer(PointerShape::Text),
-        },
-        MouseBinding {
-            context: MouseContextVar::PointerShapeEnabled
-                + !MouseContextVar::LeftButtonIsDown
-                + MouseContextVar::IsPointerTarget,
-            action: MouseEventAction::SetPointer(PointerShape::Pointer),
-        },
-        MouseBinding {
-            context: MouseContextVar::PointerShapeEnabled
-                + !MouseContextVar::LeftButtonIsDown
+        MouseBinding::new(
+            ContextExpr::from(MouseContextVar::SmartModeScroll),
+            &[MouseEventAction::DisableMouseCapture],
+        ),
+        MouseBinding::new(
+            ContextExpr::from(MouseContextVar::SmartModeClickAboveViewport),
+            &[MouseEventAction::DisableMouseCapture],
+        ),
+    ]
+});
+
+pub static DEFAULT_POINTER_SHAPE_BINDINGS: LazyLock<Vec<MouseBinding>> = LazyLock::new(|| {
+    vec![
+        MouseBinding::new(
+            ContextExpr::from(MouseContextVar::OverCellDirectly(TagPattern::Command)),
+            &[MouseEventAction::SetPointer(PointerShape::Text)],
+        ),
+        MouseBinding::new(
+            ContextExpr::from(MouseContextVar::DragStartCommand),
+            &[MouseEventAction::SetPointer(PointerShape::Text)],
+        ),
+        MouseBinding::new(
+            MouseContextVar::LeftButtonIsDown + MouseContextVar::DragStartPointerTarget,
+            &[MouseEventAction::SetPointer(PointerShape::Grabbing)],
+        ),
+        MouseBinding::new(
+            !MouseContextVar::LeftButtonIsDown + MouseContextVar::IsPointerTarget,
+            &[MouseEventAction::SetPointer(PointerShape::Pointer)],
+        ),
+        MouseBinding::new(
+            !MouseContextVar::LeftButtonIsDown
                 + !MouseContextVar::OverCellDirectly(TagPattern::Command)
                 + !MouseContextVar::IsPointerTarget,
-            action: MouseEventAction::SetPointer(PointerShape::Default),
-        },
+            &[MouseEventAction::SetPointer(PointerShape::Default)],
+        ),
     ]
 });
 
@@ -724,71 +846,45 @@ impl MouseEventAction {
         );
 
         match self {
-            MouseEventAction::CopySelection => {
+            MouseEventAction::Copy => {
+                KeyEventAction::CopyTarget
+                    .run(app, KeyEvent::new(KeyCode::Null, KeyModifiers::NONE));
                 app.right_click_popup_pos = None;
-                KeyEventAction::CopySelectionOsc52.run(
-                    app,
-                    crossterm::event::KeyEvent::new(
-                        crossterm::event::KeyCode::Null,
-                        crossterm::event::KeyModifiers::NONE,
-                    ),
-                );
                 MouseActionOutput::update_now()
             }
-            MouseEventAction::CutSelection => {
+            MouseEventAction::Cut => {
+                KeyEventAction::CutSelection
+                    .run(app, KeyEvent::new(KeyCode::Null, KeyModifiers::NONE));
                 app.right_click_popup_pos = None;
-                KeyEventAction::CutSelection.run(
-                    app,
-                    crossterm::event::KeyEvent::new(
-                        crossterm::event::KeyCode::Null,
-                        crossterm::event::KeyModifiers::NONE,
-                    ),
-                );
                 MouseActionOutput::update_now()
             }
-            MouseEventAction::PasteSelection => {
+            MouseEventAction::Paste => {
+                KeyEventAction::PasteSystemClipboard
+                    .run(app, KeyEvent::new(KeyCode::Null, KeyModifiers::NONE));
                 app.right_click_popup_pos = None;
                 app.right_click_copy_target = None;
-                KeyEventAction::PasteSystemClipboard.run(
-                    app,
-                    crossterm::event::KeyEvent::new(
-                        crossterm::event::KeyCode::Null,
-                        crossterm::event::KeyModifiers::NONE,
-                    ),
-                );
                 MouseActionOutput::update_now()
             }
             MouseEventAction::Undo => {
+                KeyEventAction::Undo.run(app, KeyEvent::new(KeyCode::Null, KeyModifiers::NONE));
                 app.right_click_popup_pos = None;
                 app.right_click_copy_target = None;
-                KeyEventAction::Undo.run(
-                    app,
-                    crossterm::event::KeyEvent::new(
-                        crossterm::event::KeyCode::Null,
-                        crossterm::event::KeyModifiers::NONE,
-                    ),
-                );
                 MouseActionOutput::update_now()
             }
             MouseEventAction::Redo => {
+                KeyEventAction::Redo.run(app, KeyEvent::new(KeyCode::Null, KeyModifiers::NONE));
                 app.right_click_popup_pos = None;
                 app.right_click_copy_target = None;
-                KeyEventAction::Redo.run(
-                    app,
-                    crossterm::event::KeyEvent::new(
-                        crossterm::event::KeyCode::Null,
-                        crossterm::event::KeyModifiers::NONE,
-                    ),
-                );
                 MouseActionOutput::update_now()
             }
             MouseEventAction::RunTutorial => {
                 app.settings.run_tutorial = true;
                 app.settings.tutorial_step = crate::tutorial::TutorialStep::Welcome;
-                if let Err(e) = crossterm::execute!(
-                    std::io::stdout(),
-                    crossterm::terminal::Clear(crossterm::terminal::ClearType::All),
-                    crossterm::cursor::MoveTo(0, 0)
+                use termina::escape::csi::{Csi, Cursor, Edit, EraseInDisplay};
+                if let Err(e) = crate::flush_stdout!(
+                    "{}{}",
+                    Csi::Edit(Edit::EraseInDisplay(EraseInDisplay::EraseDisplay)),
+                    Csi::Cursor(Cursor::goto(0, 0))
                 ) {
                     log::warn!("Failed to clear terminal: {}", e);
                 }
@@ -852,16 +948,14 @@ impl MouseEventAction {
                 MouseActionOutput::dont_update()
             }
             MouseEventAction::ScrollHistoryUp => {
-                if let ContentMode::FuzzyHistorySearch(ref source) = app.content_mode {
-                    let source = source.clone();
+                if let ContentMode::FuzzyHistorySearch(source) = app.content_mode {
                     app.select_fuzzy_history_manager_mut(&source)
                         .fuzzy_search_onkeypress(crate::history::HistorySearchDirection::Forward);
                 }
                 MouseActionOutput::dont_update()
             }
             MouseEventAction::ScrollHistoryDown => {
-                if let ContentMode::FuzzyHistorySearch(ref source) = app.content_mode {
-                    let source = source.clone();
+                if let ContentMode::FuzzyHistorySearch(source) = app.content_mode {
                     app.select_fuzzy_history_manager_mut(&source)
                         .fuzzy_search_onkeypress(crate::history::HistorySearchDirection::Backward);
                 }
@@ -878,8 +972,7 @@ impl MouseEventAction {
             }
             MouseEventAction::HoverHistoryResult => {
                 if let Some(Tag::HistoryResult(idx)) = clicked_tag {
-                    if let ContentMode::FuzzyHistorySearch(ref source) = app.content_mode {
-                        let source = source.clone();
+                    if let ContentMode::FuzzyHistorySearch(source) = app.content_mode {
                         app.select_fuzzy_history_manager_mut(&source)
                             .fuzzy_search_set_idx(Some(idx));
                     }
@@ -1004,6 +1097,20 @@ impl MouseEventAction {
                     MouseActionOutput::dont_update()
                 }
             }
+            MouseEventAction::SelectLine => {
+                if let Some(Tag::Command(byte_pos)) = clicked_tag {
+                    if app.settings.select_with_mouse {
+                        app.buffer
+                            .try_move_cursor_to_byte_pos(byte_pos, move_past_final);
+                        app.buffer.select_line_using_mouse();
+                        MouseActionOutput::update_now()
+                    } else {
+                        MouseActionOutput::dont_update()
+                    }
+                } else {
+                    MouseActionOutput::dont_update()
+                }
+            }
             MouseEventAction::DragCommand => {
                 if let Some(Tag::Command(byte_pos)) = clicked_tag {
                     if app.settings.select_with_mouse {
@@ -1056,6 +1163,38 @@ impl MouseEventAction {
                     MouseActionOutput::dont_update()
                 }
             }
+            MouseEventAction::DragLine => {
+                if let Some(Tag::Command(byte_pos)) = clicked_tag {
+                    if app.settings.select_with_mouse {
+                        let active_drag_tag = app.mouse_state.drag_start_tag;
+                        if matches!(active_drag_tag, Some(Tag::Command(_))) {
+                            if let Some(drag_start_pos) =
+                                app.mouse_state.get_last_click_buffer_pos()
+                            {
+                                app.buffer
+                                    .try_move_cursor_to_byte_pos(drag_start_pos, move_past_final);
+                                let anchor_line_sel_range = app.buffer.select_line_using_mouse();
+                                app.buffer
+                                    .try_move_cursor_to_byte_pos(byte_pos, move_past_final);
+                                let new_line_sel_range = app.buffer.select_line_using_mouse();
+                                let new_sel_range =
+                                    anchor_line_sel_range.start.min(new_line_sel_range.start)
+                                        ..anchor_line_sel_range.end.max(new_line_sel_range.end);
+                                let cursor_is_left = drag_start_pos > byte_pos;
+                                app.buffer
+                                    .set_selection_range(new_sel_range, cursor_is_left);
+                            }
+                            MouseActionOutput::update_soon()
+                        } else {
+                            MouseActionOutput::dont_update()
+                        }
+                    } else {
+                        MouseActionOutput::dont_update()
+                    }
+                } else {
+                    MouseActionOutput::dont_update()
+                }
+            }
             MouseEventAction::DragAll => {
                 if app.settings.select_with_mouse {
                     app.buffer.select_entire_buffer();
@@ -1081,13 +1220,8 @@ impl MouseEventAction {
                 MouseActionOutput::dont_update()
             }
             MouseEventAction::PromptDirAccept => {
-                KeyEventAction::PromptDirAcceptEntry.run(
-                    app,
-                    crossterm::event::KeyEvent::new(
-                        crossterm::event::KeyCode::Null,
-                        crossterm::event::KeyModifiers::NONE,
-                    ),
-                );
+                KeyEventAction::PromptDirAcceptEntry
+                    .run(app, KeyEvent::new(KeyCode::Null, KeyModifiers::NONE));
                 MouseActionOutput::update_now()
             }
             MouseEventAction::PromptDirSelect => {
@@ -1253,9 +1387,25 @@ impl MouseEventAction {
                     .set_right_click_down_pos(mouse.row, mouse.column);
 
                 let target = match clicked_tag {
+                    Some(Tag::Suggestion(idx)) => {
+                        if let ContentMode::TabCompletion(ref active_suggestions) = app.content_mode
+                        {
+                            active_suggestions
+                                .filtered_suggestions
+                                .get(idx)
+                                .and_then(|item| {
+                                    active_suggestions
+                                        .processed_suggestions
+                                        .get(item.suggestion_idx)
+                                })
+                                .map(|s| crate::app::RightClickCopyTarget::Suggestion(s.s.clone()))
+                        } else {
+                            None
+                        }
+                    }
                     Some(Tag::HistoryResult(idx)) => {
-                        let source = match &app.content_mode {
-                            ContentMode::FuzzyHistorySearch(s) => Some(s.clone()),
+                        let source = match app.content_mode {
+                            ContentMode::FuzzyHistorySearch(s) => Some(s),
                             _ => None,
                         };
                         let text_opt = source.and_then(|s| {
@@ -1268,6 +1418,23 @@ impl MouseEventAction {
                         .prompt_manager
                         .cwd_path_for_index(idx)
                         .map(crate::app::RightClickCopyTarget::Cwd),
+                    Some(Tag::AiResult(idx)) => {
+                        if let ContentMode::AgentOutputSelection(ref selection) = app.content_mode {
+                            selection.suggestions.get(idx).map(|s| {
+                                crate::app::RightClickCopyTarget::AiResult(s.command.clone())
+                            })
+                        } else {
+                            None
+                        }
+                    }
+                    Some(Tag::Clipboard(clipboard_type)) => app
+                        .last_contents
+                        .as_ref()
+                        .and_then(|c| c.contents.clipboards.get(&clipboard_type))
+                        .map(|text| crate::app::RightClickCopyTarget::Clipboard(text.clone())),
+                    Some(Tag::PromptCopyBufferWidget) => Some(
+                        crate::app::RightClickCopyTarget::Buffer(app.buffer.buffer().to_string()),
+                    ),
                     _ => None,
                 };
 
@@ -1282,9 +1449,13 @@ impl MouseEventAction {
                 MouseActionOutput::dont_update()
             }
             MouseEventAction::RightClickMenuDismiss => {
-                app.right_click_popup_pos = None;
-                app.right_click_copy_target = None;
-                MouseActionOutput::dont_update()
+                if app.right_click_popup_pos.is_some() {
+                    app.right_click_popup_pos = None;
+                    app.right_click_copy_target = None;
+                    MouseActionOutput::update_now()
+                } else {
+                    MouseActionOutput::dont_update()
+                }
             }
             MouseEventAction::SetPointer(shape) => {
                 let mut output = MouseActionOutput::dont_update();

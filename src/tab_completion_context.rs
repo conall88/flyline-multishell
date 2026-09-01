@@ -59,6 +59,7 @@ pub struct CompletionContext<'a> {
     pub context: SubString,
     pub cursor_byte_pos: usize,
     pub word_under_cursor: SubString,
+    pub is_inside_quotes: bool,
 }
 
 impl<'a> CompletionContext<'a> {
@@ -67,6 +68,7 @@ impl<'a> CompletionContext<'a> {
         cursor_byte_pos: usize,
         context: &'a str,
         word_under_cursor: SubString,
+        is_inside_quotes: bool,
     ) -> Self {
         if cfg!(test) {
             dbg!(&buffer);
@@ -82,6 +84,7 @@ impl<'a> CompletionContext<'a> {
             context,
             cursor_byte_pos,
             word_under_cursor,
+            is_inside_quotes,
         }
     }
 
@@ -92,6 +95,7 @@ impl<'a> CompletionContext<'a> {
             cursor_byte_pos,
             word_under_cursor: SubString::new(buffer, &buffer[cursor_byte_pos..cursor_byte_pos])
                 .unwrap(),
+            is_inside_quotes: false,
         }
     }
 
@@ -101,6 +105,7 @@ impl<'a> CompletionContext<'a> {
             context: self.context,
             cursor_byte_pos: self.cursor_byte_pos,
             word_under_cursor: self.word_under_cursor.to_owned(),
+            is_inside_quotes: self.is_inside_quotes,
         }
     }
 
@@ -222,6 +227,7 @@ impl<'a> CompletionContext<'a> {
             context: self.context.clone(),
             cursor_byte_pos,
             word_under_cursor: self.word_under_cursor.clone(),
+            is_inside_quotes: self.is_inside_quotes,
         }
     }
 
@@ -251,6 +257,7 @@ impl<'a> CompletionContext<'a> {
             context,
             cursor_byte_pos,
             word_under_cursor,
+            is_inside_quotes: self.is_inside_quotes,
         }
     }
 
@@ -306,6 +313,7 @@ impl<'a> CompletionContext<'a> {
             context: new_context,
             cursor_byte_pos,
             word_under_cursor: new_word_under_cursor,
+            is_inside_quotes: self.is_inside_quotes,
         }
     }
 }
@@ -483,7 +491,23 @@ pub fn get_completion_context<'a>(
 
     let word_under_cursor = SubString::new(buffer, &buffer[word_under_cursor_range]).unwrap();
 
-    CompletionContext::new(buffer, cursor_byte_pos, context, word_under_cursor)
+    let is_inside_quotes = match opt_cursor_node {
+        Some((_, cursor_node)) => {
+            cursor_node.annotations.is_inside_single_quotes
+                || cursor_node.annotations.is_inside_double_quotes
+                || cursor_node.token.kind == TokenKind::SingleQuote
+                || cursor_node.token.kind == TokenKind::Quote
+        }
+        None => false,
+    };
+
+    CompletionContext::new(
+        buffer,
+        cursor_byte_pos,
+        context,
+        word_under_cursor,
+        is_inside_quotes,
+    )
 }
 
 #[cfg(test)]
@@ -1640,6 +1664,7 @@ mod tests {
         let ctx = run_inline("echo $HOM█");
 
         assert_eq!(ctx.word_under_cursor.as_ref(), "$HOM");
+        assert!(!ctx.is_inside_quotes);
         assert_eq!(
             ctx.comp_types(),
             vec![
@@ -1656,6 +1681,7 @@ mod tests {
         let ctx = run_inline("echo \"$HOM█\"");
 
         assert_eq!(ctx.word_under_cursor.as_ref(), "$HOM");
+        assert!(ctx.is_inside_quotes);
         assert_eq!(
             ctx.comp_types(),
             vec![

@@ -383,7 +383,7 @@ impl ShellBackend for BashBackend {
 }
 
 #[cfg(not(test))]
-fn bash_decode_prompt(raw: &str, is_prompt: bool) -> Option<String> {
+fn bash_decode_prompt(raw: &str, #[allow(unused_variables)] is_prompt: bool) -> Option<String> {
     if raw.is_empty() {
         return Some(String::new());
     }
@@ -408,6 +408,9 @@ fn bash_decode_prompt(raw: &str, is_prompt: bool) -> Option<String> {
             .to_string();
 
         crate::bash_symbols::locked_xfree(decoded_prompt_cstr as *mut std::ffi::c_void);
+        // Command substitution `$(...)` inside `decode_prompt_string` evaluates
+        // Bash code that reinstalls Bash's SIGCHLD handler. Reset back to SIG_DFL.
+        crate::reset_sigchld();
         decoded
     };
 
