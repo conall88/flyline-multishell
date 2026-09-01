@@ -748,24 +748,35 @@ fn verify_all_alphanumeric_chars_in_haystack(pattern: &str, haystack: &str) -> b
     true
 }
 
+fn substring_match_indices(candidate: &str, pattern: &str) -> Option<(i64, Vec<usize>)> {
+    if pattern.is_empty() {
+        return Some((0, Vec::new()));
+    }
+
+    let has_uppercase = pattern.chars().any(|c| c.is_uppercase());
+    let (cand_cmp, pat_cmp) = if has_uppercase {
+        (candidate.to_string(), pattern.to_string())
+    } else {
+        (candidate.to_lowercase(), pattern.to_lowercase())
+    };
+
+    if let Some(byte_idx) = cand_cmp.find(&pat_cmp) {
+        let start_char_idx = candidate[..byte_idx].chars().count();
+        let pat_char_count = pattern.chars().count();
+        let indices: Vec<usize> = (start_char_idx..start_char_idx + pat_char_count).collect();
+        Some((3000, indices))
+    } else {
+        None
+    }
+}
+
 pub fn fuzzy_match_with_threshold(
     matcher: &ArinaeMatcher,
     candidate: &str,
     pattern: &str,
     threshold: FuzzyMatchThreshold,
 ) -> Option<i64> {
-    let score_threshold = fuzzy_pattern_score_threshold(pattern.len(), threshold);
-
-    matcher
-        .fuzzy_match(candidate, pattern)
-        .filter(|&score| score >= score_threshold)
-        .filter(|_| {
-            if matches!(threshold, FuzzyMatchThreshold::High) {
-                verify_all_alphanumeric_chars_in_haystack(pattern, candidate)
-            } else {
-                true
-            }
-        })
+    fuzzy_indices_with_threshold(matcher, candidate, pattern, threshold).map(|(score, _)| score)
 }
 
 pub fn fuzzy_indices_with_threshold(
@@ -774,6 +785,12 @@ pub fn fuzzy_indices_with_threshold(
     pattern: &str,
     threshold: FuzzyMatchThreshold,
 ) -> Option<(i64, Vec<usize>)> {
+    const MAX_PATTERN_LENGTH: usize = 64;
+
+    if pattern.len() > MAX_PATTERN_LENGTH {
+        return substring_match_indices(candidate, pattern);
+    }
+
     let score_threshold = fuzzy_pattern_score_threshold(pattern.len(), threshold);
 
     matcher
@@ -786,6 +803,7 @@ pub fn fuzzy_indices_with_threshold(
                 true
             }
         })
+        .or_else(|| substring_match_indices(candidate, pattern))
 }
 
 pub fn style_for_path(path: &Path) -> Option<Style> {
@@ -924,7 +942,7 @@ fn color_to_ansi(color: Color, is_bg: bool) -> String {
 
 pub(crate) fn span_to_ansi(span: &Span) -> String {
     let start = style_to_ansi(span.style);
-    let reset = "\x1b[0m";
+    let reset = termina::escape::csi::Csi::Sgr(termina::escape::csi::Sgr::Reset);
     format!("{}{}{}", start, span.content, reset)
 }
 
@@ -959,10 +977,39 @@ mod fuzzy_tests {
             fuzzy_match_with_threshold(&matcher, "commit", "cmomit", FuzzyMatchThreshold::High)
                 .is_some()
         );
-        assert!(
-            fuzzy_match_with_threshold(&matcher, "commit", "com", FuzzyMatchThreshold::High)
-                .is_some()
+    }
+
+    #[test]
+    fn test_substring_fallback_for_long_pattern() {
+        let matcher = ArinaeMatcher::new(skim::CaseMatching::Smart, true);
+
+        let long_pattern = "a".repeat(65);
+        let candidate = format!("prefix_{}_suffix", long_pattern);
+        let non_matching_candidate = "prefix_b_suffix".to_string();
+
+        let res = fuzzy_indices_with_threshold(
+            &matcher,
+            &candidate,
+            &long_pattern,
+            FuzzyMatchThreshold::High,
         );
+        assert!(res.is_some());
+        let (score, indices) = res.unwrap();
+        assert_eq!(score, 3000);
+        assert_eq!(indices, (7..7 + 65).collect::<Vec<usize>>());
+
+        let res_no_match = fuzzy_indices_with_threshold(
+            &matcher,
+            &non_matching_candidate,
+            &long_pattern,
+            FuzzyMatchThreshold::High,
+        );
+        assert!(res_no_match.is_none());
+    }
+
+    #[test]
+    fn test_fuzzy_match_more() {
+        let matcher = ArinaeMatcher::new(skim::CaseMatching::Smart, true);
         assert!(
             fuzzy_match_with_threshold(&matcher, "commit", "commit", FuzzyMatchThreshold::High)
                 .is_some()

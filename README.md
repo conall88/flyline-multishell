@@ -166,6 +166,15 @@ sh install.sh --uninstall   # remove conf.d/flyline.fish, flyline-standalone, an
 - **Abbreviations don't expand inline.** `abbr` expansions are shown as alias tooltips and used for completion lookup, but typing an abbreviation in flyline inserts it literally.
 - **fish's prompt-time terminal queries are disabled while flyline is on.** fish 4.x sends blocking terminal queries (cursor position, background color) around each prompt and hard-`assert!`s if one is still pending when the next is issued (`reader.rs`, `query.is_none()`) — a TUI taking the tty from a `fish_prompt` handler consumes the reply under real terminal latency and crashes fish itself (reproduced with ≥300ms reply lag; guarded by a regression test). The widget therefore sets `FISH_TEST_NO_RECURRENT_QUERIES` while enabled and clears it on `flyline_disable`. Practical cost: fish's automatic light/dark background detection pauses while flyline is active. Accepted lines execute via a signal-deferred `commandline -f execute` (with queries off, fish's reader only drains queued readline functions when woken).
 
+### Homebrew
+
+On macOS and Linux, you can install via [Homebrew](https://formulae.brew.sh/formula/flyline):
+
+```bash
+brew install bash # Needed if you only have default macOS bash installed
+brew install flyline
+```
+
 ### Arch Linux
 
 The existing [`flyline` AUR package](https://aur.archlinux.org/packages/flyline)
@@ -917,7 +926,7 @@ This is **Bash-only**. zsh and fish hosts do not expose readline's `READLINE_*` 
 eval "$(atuin init bash)"
 flyline key bind Ctrl+r 'always=runBashCommand(__atuin_widget_run)+submitOrNewline' 
 flyline key bind Up 'editingBufferMode+cursorOnFirstLine=runBashCommand("__atuin_history --shell-up-key-binding --keymap-mode=emacs")+submitOrNewline'
-flyline key bind 'Char(?)' 'editingBufferMode+bufferIsEmpty=runBashCommand(_atuin_ai_question_mark)'
+flyline key bind '?' 'editingBufferMode+bufferIsEmpty=runBashCommand(_atuin_ai_question_mark)'
 ```
 
 ## fzf

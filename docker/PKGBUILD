@@ -1,23 +1,47 @@
-# PKGBUILD based on the official Arch Linux AUR package by orhun: https://github.com/orhun/PKGBUILDs/blob/master/flyline/PKGBUILD
+# PKGBUILD based on orhun's official AUR package: https://github.com/orhun/PKGBUILDs/blob/master/flyline/PKGBUILD
 pkgname=flyline
-pkgver=1.3.0
+pkgver=1.5.0
 pkgrel=1
 pkgdesc="A Bash plugin to replace readline for a modern line editing experience"
 arch=('x86_64' 'aarch64')
 url="https://github.com/HalFrgrd/flyline"
 license=('MIT' 'GPL-3.0-only')
-depends=('bash' 'gcc-libs')
+depends=('bash' 'glibc' 'libgcc')
 makedepends=('cargo')
-options=('!lto')
+
+# c.f. https://gitlab.archlinux.org/archlinux/rfcs/-/merge_requests/69
+_srcenv() {
+  if [ -f "$srcdir/Cargo.toml" ]; then
+    cd "$srcdir"
+  elif [ -d "$srcdir/$pkgname" ] && [ -f "$srcdir/$pkgname/Cargo.toml" ]; then
+    cd "$srcdir/$pkgname"
+  elif [ -d "$srcdir/src" ] && [ -f "$srcdir/src/Cargo.toml" ]; then
+    cd "$srcdir/src"
+  fi
+  export CARGO_HOME="$srcdir/cargo-home"
+  export CARGO_TARGET_DIR="$PWD/target"
+  export CARGO_PROFILE_RELEASE_DEBUG=2
+  export CARGO_PROFILE_RELEASE_STRIP=false
+  export CARGO_PROFILE_RELEASE_LTO=true
+  export CARGO_PROFILE_RELEASE_CODEGEN_UNITS=1
+  export CARGO_PROFILE_RELEASE_OPT_LEVEL=3
+  CFLAGS+=' -ffat-lto-objects'
+}
 
 build() {
-  cd "$startdir/src"
-  cargo build --release
+  _srcenv
+  cargo build --release --lib
+}
+
+check() {
+  _srcenv
+  cargo test --release --lib
 }
 
 package() {
-  cd "$startdir/src"
-  install -Dm 755 "target/release/lib$pkgname.so" "$pkgdir/usr/lib/bash/lib$pkgname.so"
+  _srcenv
+  install -Dm 755 "$CARGO_TARGET_DIR/release/lib$pkgname.so" "$pkgdir/usr/lib/bash/lib$pkgname.so"
   install -Dm 644 README.md -t "$pkgdir/usr/share/doc/$pkgname"
-  install -Dm 644 LICENSE-MIT LICENSE-GPLv3 -t "$pkgdir/usr/share/licenses/$pkgname"
+  install -Dm 644 LICENSE-MIT -t "$pkgdir/usr/share/licenses/$pkgname"
+  install -Dm 644 LICENSE-GPLv3 -t "$pkgdir/usr/share/licenses/$pkgname"
 }
