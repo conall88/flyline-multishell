@@ -2,6 +2,11 @@ pub(crate) const CHANGELOG: &str = r#"# Changelog
 
 # flyline-multishell fork
 
+## v1.3.1
+- **Fish interactive input**: Commands accepted through flyline under fish can read input again (`read`, `sudo` passwords, `pacman`/`apt` confirmations). The fish widget restores normal terminal settings while the command runs, on both fish 3.7 and fish 4.x. Thanks to @itsJai42 for the report, diagnosis, and first fix (#14).
+- **Fish 4.x test coverage**: CI and the release install tests now run on fish 4.9.3 as well as the distro fish 3.7.
+- **Clean prompt rendering**: Prompts no longer show stray `(B` after colour resets (fish 3.x `set_color normal`, `tput sgr0` in Bash and zsh prompts) or `78` from cursor save/restore escapes, and DEC line-drawing characters render as box glyphs. The same applies to completion descriptions.
+
 ## v1.3.0
 - **Install channels**: `FLYLINE_CHANNEL=stable|prerelease|dev` (default `stable` = GitHub `releases/latest`) and `FLYLINE_INSTALL_VERSION=<tag>` to pin. Channel env vars must be set on `sh` (for example `curl … | FLYLINE_CHANNEL=dev sh`). Development snapshots use unique `dev-YYYYMMDD-<sha>` tags and do not bump `Cargo.toml`.
 - **Atomic install**: Release files are staged, then renamed into place, so a failed install cannot leave a half-written `libflyline.so`.
