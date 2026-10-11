@@ -1,9 +1,9 @@
 use crate::content_builder::{Tag, TaggedLine, TaggedSpan};
+#[cfg(not(test))]
+use crate::content_utils::ansi_to_text;
 use crate::kill_on_drop_child::KillOnDropChild;
 use crate::settings::{Placeholder, PromptAnimation, PromptWidget, PromptWidgetCustom};
 use crate::shell::backend;
-#[cfg(not(test))]
-use ansi_to_tui::IntoText;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use std::collections::HashMap;
@@ -195,7 +195,7 @@ pub struct PromptManager {
 
 /// Pass a raw bash prompt string (with any time-code placeholders already
 /// substituted) through bash's `decode_prompt_string`, then convert the
-/// decoded output to a `Vec<Line<'static>>` via [`IntoText`].
+/// decoded output to a `Vec<Line<'static>>` via [`ansi_to_text`].
 ///
 /// `\[` / `\]` non-printing-sequence markers are stripped before the string is
 /// handed to `decode_prompt_string` because they are Bash-specific and not
@@ -216,7 +216,7 @@ fn expand_prompt_through_bash(raw: String) -> Option<Vec<Line<'static>>> {
 
     let decoded = backend().decode_prompt(&raw, true)?;
 
-    let mut lines = decoded.into_text().ok()?.lines;
+    let mut lines = ansi_to_text(&decoded).ok()?.lines;
     for line in &mut lines {
         for span in &mut line.spans {
             let raw = span.content.as_ref();

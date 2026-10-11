@@ -10,6 +10,7 @@ accepted line, so matching the result proves execution, not just echo.
 import fcntl
 import os
 import pty
+import re
 import select
 import struct
 import sys
@@ -96,6 +97,17 @@ def check(name, expected, blob):
         failed += 1
 
 
+def check_absent(name, pattern, blob):
+    global passed, failed
+    match = re.search(pattern, blob)
+    if match is None:
+        print(f"  PASS: {name}")
+        passed += 1
+    else:
+        print(f"  FAIL: {name}  (found: {match.group(0)!r})")
+        failed += 1
+
+
 print("== source flyline.fish with flyline binary ==")
 # $FISH_TEST_VAL only becomes 42 when fish executes the accepted line, and the
 # variable reference avoids brackets (flyline auto-closes those while typing).
@@ -105,6 +117,21 @@ out = run_shell(
     secs_per_line=4.0,  # first prompt boots the flyline TUI
 )
 check("flyline widget accepts and executes a command", "ENABLED_42", out)
+# fish 3.x's `set_color normal` emits terminfo sgr0 (`ESC ( B ESC [ m`); fish
+# itself writes it raw, but flyline must not draw the `(B` as text.
+check_absent("default prompt has no stray charset escape text", r"(?<!\x1b)\(B", out)
+
+# Non-SGR escapes from a prompt: charset designations (incl. DEC line drawing)
+# and cursor save/restore. The rendered text only appears once flyline draws
+# it; fish's own copy of the prompt keeps the raw escapes between letters.
+print("== prompt escape sequences render cleanly ==")
+out = run_shell(
+    {"FLYLINE_BIN": FLYLINE_BIN},
+    [],
+    secs_per_line=4.0,
+    pre_source="function fish_prompt; printf 'PR\\e(B\\e[mOMPT\\e(0q\\e(B\\e7\\e8> '; end",
+)
+check("prompt drawn with escapes applied", "PROMPT\u2500>", out)
 
 # Accepted lines run while fish's reader has the tty in raw settings. Commands
 # doing a plain line read (apt/pacman confirmations, `read` in scripts) must
