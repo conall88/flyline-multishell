@@ -23,7 +23,10 @@ passed = 0
 failed = 0
 
 
-def run_shell(env_overrides, lines, secs_per_line=1.5, reply_delay=0.0):
+CTRL_C = "\x03"
+
+
+def run_shell(env_overrides, lines, secs_per_line=1.5, reply_delay=0.0, pre_source=""):
     env = dict(os.environ)
     env["TERM"] = "xterm-256color"
     env["HOME"] = env.get("HOME", "/root")
@@ -31,7 +34,8 @@ def run_shell(env_overrides, lines, secs_per_line=1.5, reply_delay=0.0):
 
     pid, fd = pty.fork()
     if pid == 0:
-        os.execvpe("fish", ["fish", "-i", "-C", f"source {FLYLINE_FISH}"], env)
+        init = f"{pre_source}; source {FLYLINE_FISH}" if pre_source else f"source {FLYLINE_FISH}"
+        os.execvpe("fish", ["fish", "-i", "-C", init], env)
 
     fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 100, 0, 0))
 
@@ -69,7 +73,8 @@ def run_shell(env_overrides, lines, secs_per_line=1.5, reply_delay=0.0):
 
     pump(3.0)
     for line in lines:
-        os.write(fd, line.encode() + b"\r")
+        # Control keys are sent bare; everything else is a line ended by Enter.
+        os.write(fd, line.encode() if line == CTRL_C else line.encode() + b"\r")
         pump(secs_per_line)
     pump(2.0)
 
@@ -100,6 +105,45 @@ out = run_shell(
     secs_per_line=4.0,  # first prompt boots the flyline TUI
 )
 check("flyline widget accepts and executes a command", "ENABLED_42", out)
+
+# Accepted lines run while fish's reader has the tty in raw settings. Commands
+# doing a plain line read (apt/pacman confirmations, `read` in scripts) must
+# still see Enter end the line, from stdin and from /dev/tty.
+print("== accepted command can read confirmation input ==")
+out = run_shell(
+    {"FLYLINE_BIN": FLYLINE_BIN},
+    ["sh -c 'read answer; echo INTERACTIVE_$answer'", "yes"],
+    secs_per_line=4.0,
+)
+check("accepted command reads a line from stdin", "INTERACTIVE_yes", out)
+
+print("== accepted command can read /dev/tty ==")
+out = run_shell(
+    {"FLYLINE_BIN": FLYLINE_BIN},
+    ["sh -c 'read answer </dev/tty; echo TTY_$answer'", "yes"],
+    secs_per_line=4.0,
+)
+check("accepted command reads a line from /dev/tty", "TTY_yes", out)
+
+print("== Ctrl-C interrupts an accepted command ==")
+out = run_shell(
+    {"FLYLINE_BIN": FLYLINE_BIN, "FISH_TEST_VAL": "42"},
+    ["sleep 30", CTRL_C, "echo AFTERINT_$FISH_TEST_VAL"],
+    secs_per_line=4.0,
+)
+check("prompt works after Ctrl-C", "AFTERINT_42", out)
+
+# fish's reader expects its own tty settings back after an accepted command:
+# with normal settings left on, Enter arrives as \n and a user's `\r` binding
+# stops firing. `flyline_disable` itself is accepted through flyline here.
+print("== reader tty settings restored after an accepted command ==")
+out = run_shell(
+    {"FLYLINE_BIN": FLYLINE_BIN},
+    ["flyline_disable", "echo BIND"],
+    secs_per_line=4.0,
+    pre_source="bind \\r 'commandline -a _RESTORED; commandline -f execute'",
+)
+check("user Enter binding still fires", "BIND_RESTORED", out)
 
 print("== fail-open: missing flyline binary ==")
 out = run_shell(

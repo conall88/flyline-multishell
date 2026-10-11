@@ -8,6 +8,10 @@ if status is-interactive; and not set -q _flyline_loaded
     set -g _flyline_loaded 1
     set -g _flyline_script (status filename)
     set -g _flyline_pending ''
+    # The terminal's normal (cooked) settings. Captured before fish's reader
+    # switches the tty into its own raw settings, so accepted commands can be
+    # given back a terminal where line-based reads end at Enter.
+    set -g _flyline_tty_modes (stty -g </dev/tty 2>/dev/null)
 
     # Default to flyline-standalone next to the install dir (parent of scripts/).
     if not set -q FLYLINE_BIN
@@ -33,15 +37,24 @@ if status is-interactive; and not set -q _flyline_loaded
     set -g FISH_TEST_NO_RECURRENT_QUERIES 1
 
     # After fish_prompt returns, fish clears the commandline before the next
-    # read — so a deferred `commandline -f execute` is a no-op. Stash the
-    # accepted line and eval it from a signal handler that runs once the
-    # reader is active again (also required with queries disabled on fish 4.x).
+    # read — so on fish 3.x a deferred `commandline -f execute` is a no-op.
+    # Stash the accepted line and eval it from a signal handler that runs once
+    # the reader is active again (also required with queries disabled on fish 4.x).
+    #
+    # The handler runs while fish's reader holds the tty in raw settings (no
+    # line mode, no CR->NL), so a command doing a plain line read (`read`,
+    # apt/pacman confirmations) would never see Enter. Restore the normal
+    # settings for the command, then put the reader's back: otherwise fish
+    # reads Enter as \n and stops matching user `\r` bindings.
     function _flyline_do_execute --on-signal SIGUSR2
         if test -n "$_flyline_pending"
             set -l to_run $_flyline_pending
             set -g _flyline_pending ''
             set -e _flyline_busy
+            set -l reader_modes (stty -g </dev/tty 2>/dev/null)
+            test -n "$_flyline_tty_modes"; and stty $_flyline_tty_modes </dev/tty 2>/dev/null
             eval $to_run
+            test -n "$reader_modes"; and stty $reader_modes </dev/tty 2>/dev/null
             commandline -f repaint
         end
     end
@@ -109,6 +122,7 @@ if status is-interactive; and not set -q _flyline_loaded
         set -e _flyline_loaded
         set -e _flyline_busy
         set -g _flyline_pending ''
+        set -e _flyline_tty_modes
         set -e FISH_TEST_NO_RECURRENT_QUERIES
     end
 
