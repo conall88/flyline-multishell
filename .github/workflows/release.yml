@@ -428,10 +428,12 @@ jobs:
           - { target: install-test-bash-3-2-57,   runner: ubuntu-latest,   label: bash-3.2-x86_64, dep_cache_target: specific-bash-version-3_2_57, dep_cache_scope: bash-3_2_57 }
           - { target: install-test-release-zsh,   runner: ubuntu-latest,   label: zsh-x86_64,      dep_cache_target: "",                          dep_cache_scope: "" }
           - { target: install-test-release-fish,  runner: ubuntu-latest,   label: fish-x86_64,     dep_cache_target: "",                          dep_cache_scope: "" }
+          - { target: install-test-release-fish4, runner: ubuntu-latest,   label: fish4-x86_64,    dep_cache_target: "",                          dep_cache_scope: "" }
           - { target: test-mimalloc-symbols,      runner: ubuntu-latest,   label: mimalloc-x86_64, dep_cache_target: "",                          dep_cache_scope: "" }
           - { target: install-test-ubuntu,        runner: ubuntu-24.04-arm, label: ubuntu-arm64,   dep_cache_target: "",                          dep_cache_scope: "" }
           - { target: install-test-release-zsh,   runner: ubuntu-24.04-arm, label: zsh-arm64,      dep_cache_target: "",                          dep_cache_scope: "" }
           - { target: install-test-release-fish,  runner: ubuntu-24.04-arm, label: fish-arm64,     dep_cache_target: "",                          dep_cache_scope: "" }
+          - { target: install-test-release-fish4, runner: ubuntu-24.04-arm, label: fish4-arm64,    dep_cache_target: "",                          dep_cache_scope: "" }
     steps:
       - name: Checkout
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
