@@ -6,6 +6,12 @@ variable "PRE_BASH_4_4_VERSION_MATRIX" {
     default = ["3.2.57"]
 }
 
+# fish 4.x tested alongside the distro fish 3.7.x. Checksums are pinned in
+# docker/install_fish.sh; bump both together.
+variable "FISH4_VERSION" {
+    default = "4.9.3"
+}
+
 variable "FLYLINE_INSTALL_VERSION" {
     default = null
 }
@@ -202,6 +208,17 @@ target "fish-integration-test" {
         built-artifact = "target:extract-zsh-integration-test-build-artifact"
     }
     dockerfile = "docker/fish_integration_test.Dockerfile"
+}
+
+target "fish4-integration-test" {
+    inherits = ["fish-integration-test"]
+    args = {
+        FISH_VERSION = FISH4_VERSION
+    }
+}
+
+group "fish-integration-tests" {
+    targets = ["fish-integration-test", "fish4-integration-test"]
 }
 
 
@@ -458,6 +475,13 @@ target "install-test-release-fish" {
     }
 }
 
+target "install-test-release-fish4" {
+    inherits = ["install-test-release-fish"]
+    args = {
+        FISH_VERSION = FISH4_VERSION
+    }
+}
+
 # ---- Local-asset variants (consume docker/build-release-assets) ----
 
 target "install-test-ubuntu-local" {
@@ -492,6 +516,14 @@ target "install-test-release-fish-local" {
     }
 }
 
+target "install-test-release-fish4-local" {
+    inherits = ["install-test-release-fish4"]
+    args = {
+        FLYLINE_INSTALL_VERSION = LOCAL_ASSET_VERSION
+        FLYLINE_ASSET_BASE = LOCAL_ASSET_DIR
+    }
+}
+
 group "install-tests" {
     targets = [
         "install-test-alpine",
@@ -500,6 +532,7 @@ group "install-tests" {
         "install-test-bash-3-2-57",
         "install-test-release-zsh",
         "install-test-release-fish",
+        "install-test-release-fish4",
     ]
 }
 
@@ -512,6 +545,7 @@ group "install-tests-local" {
         "install-test-arch-local",
         "install-test-release-zsh-local",
         "install-test-release-fish-local",
+        "install-test-release-fish4-local",
     ]
 }
 
@@ -523,6 +557,7 @@ group "install-tests-local-arm64" {
         "install-test-ubuntu-local",
         "install-test-release-zsh-local",
         "install-test-release-fish-local",
+        "install-test-release-fish4-local",
     ]
 }
 

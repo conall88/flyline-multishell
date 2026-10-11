@@ -155,6 +155,7 @@ jobs:
             ${{ needs.meta.outputs.trusted == 'true' && '*.cache-to=type=gha,scope=ci-builder-arm64,mode=max' || '' }}
 
   # Fish integration coverage. Uses a Python pty driver (fish has no zpty).
+  # Runs against the distro fish 3.7.x and a pinned fish 4.x build.
   fish-integration-tests:
     name: Fish integration tests (ARM64)
     runs-on: ubuntu-24.04-arm
@@ -171,7 +172,7 @@ jobs:
         uses: docker/bake-action@d3418bd7d0e9324001bca92fa8ba175ea7e6dc9b # v7
         with:
           files: docker-bake.hcl
-          targets: fish-integration-test
+          targets: fish-integration-tests
           set: |
             *.cache-from=type=gha,scope=ci-builder-arm64
             ${{ needs.meta.outputs.trusted == 'true' && '*.cache-to=type=gha,scope=ci-builder-arm64,mode=max' || '' }}

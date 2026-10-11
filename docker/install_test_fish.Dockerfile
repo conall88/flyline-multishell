@@ -10,8 +10,12 @@ ARG FLYLINE_INSTALL_VERSION
 # When set to a local directory (e.g. /opt/flyline-assets) or an HTTP(S) base
 # URL, install.sh consumes release assets from there instead of GitHub.
 ARG FLYLINE_ASSET_BASE=
+# Empty: the distro fish (3.7.x). Set (e.g. 4.9.3): pinned static fish 4 build.
+ARG FISH_VERSION=
 
-RUN apt-get update && apt-get install -y curl fish python3 && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y curl python3 xz-utils && rm -rf /var/lib/apt/lists/*
+COPY docker/install_fish.sh /tmp/install_fish.sh
+RUN sh /tmp/install_fish.sh "${FISH_VERSION}"
 
 # Test the current tree's installer, not a previously published copy.
 COPY install.sh /tmp/flyline-install.sh
