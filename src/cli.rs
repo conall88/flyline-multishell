@@ -951,6 +951,7 @@ enum PromptWidgetSubcommands {
 }
 impl Flyline {
     pub(crate) fn call(&mut self, words: *const bash_symbols::WordList) -> c_int {
+        let _sigchld_guard = crate::SigchldGuard::new();
         let mut args = vec![];
         unsafe {
             let mut current = words;
@@ -1341,10 +1342,11 @@ pub fn run_flyline_command(cfg: &mut settings::Settings, args: &[&str]) -> c_int
                                     entries
                                 };
                                 let joined_logs = logs_to_copy.join("\n");
-                                if let Err(e) = crossterm::execute!(
-                                    std::io::stdout(),
-                                    crossterm::clipboard::CopyToClipboard::to_clipboard_from(
-                                        joined_logs
+                                if let Err(e) = crate::flush_stdout!(
+                                    "{}",
+                                    termina::escape::osc::Osc::SetSelection(
+                                        termina::escape::osc::Selection::CLIPBOARD,
+                                        &joined_logs
                                     )
                                 ) {
                                     eprintln!("Failed to copy logs to clipboard via OSC 52: {}", e);
@@ -1380,10 +1382,11 @@ pub fn run_flyline_command(cfg: &mut settings::Settings, args: &[&str]) -> c_int
                     if enabled {
                         cfg.tutorial_step = tutorial::TutorialStep::Welcome;
                         // clear the terminal:
-                        if let Err(e) = crossterm::execute!(
-                            std::io::stdout(),
-                            crossterm::terminal::Clear(crossterm::terminal::ClearType::All),
-                            crossterm::cursor::MoveTo(0, 0)
+                        use termina::escape::csi::{Csi, Cursor, Edit, EraseInDisplay};
+                        if let Err(e) = crate::flush_stdout!(
+                            "{}{}",
+                            Csi::Edit(Edit::EraseInDisplay(EraseInDisplay::EraseDisplay)),
+                            Csi::Cursor(Cursor::goto(0, 0))
                         ) {
                             log::warn!("Failed to clear terminal: {}", e);
                         }
@@ -1946,14 +1949,27 @@ fn show_version(copy: bool) {
     println!("{}", version_text);
 
     if copy {
-        if let Err(e) = crossterm::execute!(
-            std::io::stdout(),
-            crossterm::clipboard::CopyToClipboard::to_clipboard_from(version_text)
+        if let Err(e) = crate::flush_stdout!(
+            "{}",
+            termina::escape::osc::Osc::SetSelection(
+                termina::escape::osc::Selection::CLIPBOARD,
+                &version_text
+            )
         ) {
             log::error!("Failed to copy version text to clipboard via OSC 52: {}", e);
         }
         println!();
-        println!("\x1b[32mCopied to clipboard!\x1b[0m");
+        if !termina::style::Stylized::is_ansi_color_disabled() {
+            use termina::escape::csi::{Csi, Sgr};
+            use termina::style::ColorSpec;
+            println!(
+                "{}Copied to clipboard!{}",
+                Csi::Sgr(Sgr::Foreground(ColorSpec::GREEN)),
+                Csi::Sgr(Sgr::Reset)
+            );
+        } else {
+            println!("Copied to clipboard!");
+        }
     }
 }
 

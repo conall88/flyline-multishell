@@ -1,9 +1,5 @@
-use std::io::Write;
-
-use crossterm::Command;
-use crossterm::QueueableCommand;
-use crossterm::cursor::{MoveTo, RestorePosition, SavePosition};
 use ratatui::prelude::Position;
+use std::io::Write;
 
 static IS_VSCODE: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
     crate::shell::backend().env_var("TERM_PROGRAM").as_deref() == Some("vscode")
@@ -120,8 +116,8 @@ impl EscapeCodes {
     }
 }
 
-impl Command for EscapeCodes {
-    fn write_ansi(&self, f: &mut impl core::fmt::Write) -> core::fmt::Result {
+impl std::fmt::Display for EscapeCodes {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let bash_pid = crate::shell::backend().shell_pgrp();
 
         match self {
@@ -295,8 +291,11 @@ pub fn write_on_exit_codes(commandline: Option<&str>) -> std::io::Result<()> {
 }
 
 pub fn write_escape_codes(codes: &[EscapeCodes]) -> std::io::Result<()> {
+    use termina::OneBased;
+    use termina::escape::csi::{Csi, Cursor};
+
     let mut queue = std::io::stdout();
-    queue.queue(SavePosition)?;
+    write!(queue, "{}", Csi::Cursor(Cursor::SaveCursor))?;
 
     for code in codes {
         let position = match code {
@@ -313,12 +312,19 @@ pub fn write_escape_codes(codes: &[EscapeCodes]) -> std::io::Result<()> {
                 row,
                 code
             );
-            queue.queue(MoveTo(col, row))?;
+            write!(
+                queue,
+                "{}",
+                Csi::Cursor(Cursor::Position {
+                    line: OneBased::from_zero_based(row),
+                    col: OneBased::from_zero_based(col),
+                })
+            )?;
         }
         log::trace!("Writing escape code: {:?}", code);
-        queue.queue(code)?;
+        write!(queue, "{}", code)?;
     }
-    queue.queue(RestorePosition)?;
+    write!(queue, "{}", Csi::Cursor(Cursor::RestoreCursor))?;
     queue.flush()?;
     Ok(())
 }

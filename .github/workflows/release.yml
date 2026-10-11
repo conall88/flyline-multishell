@@ -261,6 +261,11 @@ jobs:
           - { target: x86_64-unknown-linux-gnu,       os: ubuntu-latest, build_tool: cross, lib: libflyline.so,    feature_flags: "--features pre_bash_4_4", suffix: "_pre_bash_4_4" }
           # FreeBSD (via cross)
           - { target: x86_64-unknown-freebsd,         os: ubuntu-latest, build_tool: cross, lib: libflyline.so,    feature_flags: "",                        suffix: "" }
+          # Android (via cross)
+          - { target: aarch64-linux-android,          os: ubuntu-latest, build_tool: cross, lib: libflyline.so,    feature_flags: "",                        suffix: "" }
+          - { target: x86_64-linux-android,           os: ubuntu-latest, build_tool: cross, lib: libflyline.so,    feature_flags: "",                        suffix: "" }
+          - { target: armv7-linux-androideabi,        os: ubuntu-latest, build_tool: cross, lib: libflyline.so,    feature_flags: "",                        suffix: "" }
+          - { target: i686-linux-android,             os: ubuntu-latest, build_tool: cross, lib: libflyline.so,    feature_flags: "",                        suffix: "" }
           # macOS (native cargo)
           - { target: x86_64-apple-darwin,            os: macos-latest,  build_tool: cargo, lib: libflyline.dylib, feature_flags: "",                        suffix: "" }
           - { target: aarch64-apple-darwin,           os: macos-latest,  build_tool: cargo, lib: libflyline.dylib, feature_flags: "",                        suffix: "" }
@@ -425,6 +430,7 @@ jobs:
           - { target: install-test-alpine,        runner: ubuntu-latest,   label: alpine-x86_64,   dep_cache_target: "",                          dep_cache_scope: "" }
           - { target: install-test-ubuntu,        runner: ubuntu-latest,   label: ubuntu-x86_64,   dep_cache_target: "",                          dep_cache_scope: "" }
           - { target: install-test-arch,          runner: ubuntu-latest,   label: arch-x86_64,     dep_cache_target: "",                          dep_cache_scope: "" }
+          - { target: install-test-termux,        runner: ubuntu-latest,   label: termux-x86_64,   dep_cache_target: "",                          dep_cache_scope: "" }
           - { target: install-test-bash-3-2-57,   runner: ubuntu-latest,   label: bash-3.2-x86_64, dep_cache_target: specific-bash-version-3_2_57, dep_cache_scope: bash-3_2_57 }
           - { target: install-test-release-zsh,   runner: ubuntu-latest,   label: zsh-x86_64,      dep_cache_target: "",                          dep_cache_scope: "" }
           - { target: install-test-release-fish,  runner: ubuntu-latest,   label: fish-x86_64,     dep_cache_target: "",                          dep_cache_scope: "" }
