@@ -9,6 +9,16 @@ pub const FILENAME_INFERENCE_LIMIT: usize = 5000;
 #[cfg(feature = "pre_bash_4_4")]
 use ctor::ctor;
 
+/// Writes formatted arguments to stdout and flushes immediately.
+#[macro_export]
+macro_rules! flush_stdout {
+    ($($arg:tt)*) => {{
+        use std::io::Write;
+        let mut stdout = std::io::stdout();
+        write!(stdout, $($arg)*).and_then(|_| stdout.flush())
+    }};
+}
+
 #[macro_use]
 pub(crate) mod perf;
 mod active_suggestions;
@@ -186,20 +196,14 @@ impl Flyline {
 
             // I haven't bothered replicating this line either:
             //   sh_unset_nodelay_mode (fileno (rl_instream));	/* just in case */
-            // Bash sets SIGCHLD to SIG_IGN, causing the kernel to auto-reap child
-            // processes, which makes output()'s internal wait() fail with ECHILD.
-            // Restore SIG_DFL for the entire duration of the app (covers all
-            // background threads spawned for prompt widgets and agent mode), then
-            // put the original disposition back once the app exits.
-            // SAFETY: signal(2) only modifies the signal disposition; no other
-            // thread depends on SIGCHLD disposition at this instant.
-            let prev_sigchld = unsafe { libc::signal(libc::SIGCHLD, libc::SIG_DFL) };
+            // Reset SIGCHLD to SIG_DFL so child process spawning works without ECHILD;
+            // SigchldGuard restores Bash's original handler upon drop.
+
+            let _sigchld_guard = SigchldGuard::new();
 
             let result = app::get_command(&mut self.settings);
 
             self.settings.last_app_closed_at = Some(std::time::Instant::now());
-
-            unsafe { libc::signal(libc::SIGCHLD, prev_sigchld) };
 
             // Join the background cache warming thread before returning control to Bash.
             // This ensures that no background Rust threads are running or calling Bash FFI
@@ -551,4 +555,54 @@ fn get_library_directory() -> Option<std::path::PathBuf> {
         }
     }
     None
+}
+
+/// Resets `SIGCHLD` disposition to `SIG_DFL` (default action) using `sigaction(2)`.
+///
+/// Bash frequently installs its own `SIGCHLD` handler (e.g. during prompt expansion
+/// or command substitution execution), which interferes with process spawning in Rust
+/// (`std::process::Command`), causing child wait calls to fail with `ECHILD`.
+///
+/// Using `sigaction` with `SIG_DFL` ensures `SA_NOCLDWAIT` and custom signal handlers are cleared.
+pub fn reset_sigchld() {
+    unsafe {
+        let mut action: libc::sigaction = std::mem::zeroed();
+        action.sa_sigaction = libc::SIG_DFL as usize;
+        libc::sigaction(libc::SIGCHLD, &action, std::ptr::null_mut());
+    }
+}
+
+/// An RAII guard that sets `SIGCHLD` to `SIG_DFL` upon creation, and restores
+/// the previous signal disposition when dropped (even on panic or early return).
+#[must_use]
+pub struct SigchldGuard {
+    prev_action: libc::sigaction,
+}
+
+impl SigchldGuard {
+    /// Resets `SIGCHLD` to `SIG_DFL` and returns a guard that will restore
+    /// the previous `SIGCHLD` disposition when dropped.
+    pub fn new() -> Self {
+        unsafe {
+            let mut prev_action: libc::sigaction = std::mem::zeroed();
+            let mut new_action: libc::sigaction = std::mem::zeroed();
+            new_action.sa_sigaction = libc::SIG_DFL as usize;
+            libc::sigaction(libc::SIGCHLD, &new_action, &mut prev_action);
+            Self { prev_action }
+        }
+    }
+}
+
+impl Default for SigchldGuard {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Drop for SigchldGuard {
+    fn drop(&mut self) {
+        unsafe {
+            libc::sigaction(libc::SIGCHLD, &self.prev_action, std::ptr::null_mut());
+        }
+    }
 }

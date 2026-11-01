@@ -115,6 +115,9 @@ pub static mut terminating_signal: c_int = 0;
 pub static mut rl_signal_event_hook: Option<extern "C" fn()> = None;
 #[unsafe(no_mangle)]
 pub static mut job_control: c_int = 0;
+#[cfg(not(feature = "pre_bash_4_4"))]
+#[unsafe(no_mangle)]
+pub static mut autocd: c_int = 0;
 #[unsafe(no_mangle)]
 pub static mut shell_pgrp: pid_t = 0;
 #[unsafe(no_mangle)]

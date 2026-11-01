@@ -167,6 +167,15 @@ sh install.sh --uninstall   # remove conf.d/flyline.fish, flyline-standalone, an
 - **fish's prompt-time terminal queries are disabled while flyline is on.** fish 4.x sends blocking terminal queries (cursor position, background color) around each prompt and hard-`assert!`s if one is still pending when the next is issued (`reader.rs`, `query.is_none()`) — a TUI taking the tty from a `fish_prompt` handler consumes the reply under real terminal latency and crashes fish itself (reproduced with ≥300ms reply lag; guarded by a regression test). The widget therefore sets `FISH_TEST_NO_RECURRENT_QUERIES` while enabled and clears it on `flyline_disable`. Practical cost: fish's automatic light/dark background detection pauses while flyline is active.
 - **Accepted lines run from a signal handler.** After `fish_prompt` returns, fish 3.x discards a queued `commandline -f execute`, so the widget `eval`s the accepted line from a deferred `SIGUSR2` handler instead. Because fish's reader holds the terminal in raw settings at that point, the widget restores the terminal's normal settings for the command (so `read`, `apt`/`pacman` confirmations, and other line-based prompts see Enter) and puts the reader's settings back afterwards. Covered on fish 3.7.x and 4.x by the fish integration tests.
 
+### Homebrew
+
+On macOS and Linux, you can install via [Homebrew](https://formulae.brew.sh/formula/flyline):
+
+```bash
+brew install bash # Needed if you only have default macOS bash installed
+brew install flyline
+```
+
 ### Arch Linux
 
 The existing [`flyline` AUR package](https://aur.archlinux.org/packages/flyline)
@@ -918,7 +927,7 @@ This is **Bash-only**. zsh and fish hosts do not expose readline's `READLINE_*` 
 eval "$(atuin init bash)"
 flyline key bind Ctrl+r 'always=runBashCommand(__atuin_widget_run)+submitOrNewline' 
 flyline key bind Up 'editingBufferMode+cursorOnFirstLine=runBashCommand("__atuin_history --shell-up-key-binding --keymap-mode=emacs")+submitOrNewline'
-flyline key bind 'Char(?)' 'editingBufferMode+bufferIsEmpty=runBashCommand(_atuin_ai_question_mark)'
+flyline key bind '?' 'editingBufferMode+bufferIsEmpty=runBashCommand(_atuin_ai_question_mark)'
 ```
 
 ## fzf

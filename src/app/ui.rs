@@ -527,27 +527,24 @@ impl<'a> App<'a> {
                 true,
             );
 
-            let dummy = ("none".to_string(), "none".to_string());
-            let matches_iter = last_mouse
+            let (ctx, act) = last_mouse
                 .matches
-                .iter()
-                .chain(std::iter::repeat(&dummy))
-                .take(2);
+                .first()
+                .map(|(c, a)| (c.as_str(), a.as_str()))
+                .unwrap_or(("none", "none"));
 
-            for (ctx, act) in matches_iter {
-                content.write_tagged_line(
-                    &TaggedLine::from_line(
-                        Line::from(format!("       context: {}  action: {}", ctx, act)).style(
-                            self.settings
-                                .colour_palette
-                                .secondary_text()
-                                .add_modifier(Modifier::BOLD),
-                        ),
-                        Tag::Normal,
+            content.write_tagged_line(
+                &TaggedLine::from_line(
+                    Line::from(format!("       context: {}  action: {}", ctx, act)).style(
+                        self.settings
+                            .colour_palette
+                            .secondary_text()
+                            .add_modifier(Modifier::BOLD),
                     ),
-                    true,
-                );
-            }
+                    Tag::Normal,
+                ),
+                true,
+            );
         }
 
         content.prompt_start = Some(content.cursor_position());
@@ -1485,20 +1482,18 @@ impl<'a> App<'a> {
                     RightClickCopyTarget::Buffer(_) => "⎘ Copy (buffer)".to_string(),
                     RightClickCopyTarget::HistoryEntry(_) => "⎘ Copy (history entry)".to_string(),
                     RightClickCopyTarget::Cwd(_) => "⎘ Copy (cwd)".to_string(),
+                    RightClickCopyTarget::Suggestion(_) => "⎘ Copy (suggestion)".to_string(),
+                    RightClickCopyTarget::AiResult(_) => "⎘ Copy (AI result)".to_string(),
+                    RightClickCopyTarget::Clipboard(_) => "⎘ Copy (clipboard)".to_string(),
                 }
             } else {
                 "⎘ Copy".to_string()
             };
 
-            let cut_label = if let Some(ref target) = self.right_click_copy_target {
-                match target {
-                    RightClickCopyTarget::Selection(_) => "✂ Cut (selection)".to_string(),
-                    RightClickCopyTarget::Buffer(_) => "✂ Cut (buffer)".to_string(),
-                    RightClickCopyTarget::HistoryEntry(_) => "✂ Cut (history entry)".to_string(),
-                    RightClickCopyTarget::Cwd(_) => "✂ Cut (cwd)".to_string(),
-                }
+            let cut_label = if self.buffer.selected_text().is_some() {
+                "✂ Cut (selection)".to_string()
             } else {
-                "✂ Cut".to_string()
+                "✂ Cut (buffer)".to_string()
             };
 
             let entries = [
@@ -1549,7 +1544,12 @@ impl<'a> App<'a> {
 
         content
     }
-    pub(crate) fn ui(&mut self, frame: &mut Frame, content: Contents) {
+    pub(crate) fn ui(
+        frame: &mut Frame,
+        content: Contents,
+        needs_full_redraw: bool,
+        show_terminal_cursor: bool,
+    ) -> DrawnContent {
         let frame_area = frame.area();
         frame.buffer_mut().reset();
 
@@ -1564,7 +1564,7 @@ impl<'a> App<'a> {
                     for (x, tagged_cell) in row.iter().enumerate() {
                         if x < frame_area.width as usize {
                             let mut cell = tagged_cell.cell.clone();
-                            if self.needs_full_redraw {
+                            if needs_full_redraw {
                                 cell.set_diff_option(ratatui::buffer::CellDiffOption::AlwaysUpdate);
                             }
                             frame.buffer_mut().content
@@ -1576,30 +1576,19 @@ impl<'a> App<'a> {
             };
         }
 
-        if self.needs_full_redraw {
-            self.needs_full_redraw = false;
-        }
-
         let drawn_content = DrawnContent {
             contents: content,
             viewport_start: frame_area.y,
             content_visible_row_range,
         };
 
-        if let Some(term_em_cursor) = drawn_content.term_em_cursor_pos()
-            && (self.settings.cursor_config.backend() == CursorBackend::Terminal
-                || !self.mode.is_running())
-            && !(self.mouse_state.is_left_button_down()
-                && self.buffer.selection_range().is_some()
-                && matches!(
-                    self.mouse_state.last_mouse_over_cell_semantic,
-                    Some(Tag::Command(_))
-                ))
-        {
-            frame.set_cursor_position(term_em_cursor);
+        if show_terminal_cursor {
+            if let Some(term_em_cursor) = drawn_content.term_em_cursor_pos() {
+                frame.set_cursor_position(term_em_cursor);
+            }
         }
 
-        self.last_contents = Some(drawn_content);
+        drawn_content
     }
 
     fn render_user_suggestions(

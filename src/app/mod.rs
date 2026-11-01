@@ -27,6 +27,9 @@ pub enum RightClickCopyTarget {
     Buffer(String),
     HistoryEntry(String),
     Cwd(String),
+    Suggestion(String),
+    AiResult(String),
+    Clipboard(String),
 }
 
 use crate::active_suggestions::{
@@ -49,10 +52,7 @@ use crate::settings::{self, MatrixAnimation, MouseMode, Settings};
 use crate::shell_integration;
 use crate::text_buffer::{SubString, TextBuffer};
 use crate::{bash_symbols, command_acceptance};
-use crossterm::event::{
-    self, Event as CrosstermEvent, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent,
-    MouseEventKind,
-};
+
 use flash::lexer::TokenKind;
 use itertools::Itertools;
 use ratatui::prelude::*;
@@ -62,6 +62,24 @@ use std::boxed::Box;
 use std::io::{Error, ErrorKind, IsTerminal};
 use std::time::Duration;
 use std::vec;
+use termina::escape::csi::{
+    Csi, DecPrivateMode, DecPrivateModeCode, Keyboard, KittyKeyboardFlags, Mode as DecMode,
+};
+use termina::event::{
+    KeyCode, KeyEvent, Modifiers as KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
+use termina::{Event as TerminaEvent, Terminal};
+
+use std::io::Write;
+use std::sync::LazyLock;
+
+/// The reason for the global event reader is that it often buffers events
+/// and if we drop it, those buffered events are lost.
+/// This is apparent when you type `sleep 5\necho foo\necho bar\n`.
+pub static GLOBAL_EVENT_READER: LazyLock<termina::EventReader> = LazyLock::new(|| {
+    let temp_terminal = termina::PlatformTerminal::new().unwrap();
+    temp_terminal.event_reader()
+});
 
 /// After this duration of inactivity the frame rate drops to 0.2 fps and the
 /// cursor is rendered in the unfocused (dim, non-animated) state.
@@ -70,62 +88,41 @@ const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 /// Frame rate (fps) used when the user has been idle for longer than [`IDLE_TIMEOUT`].
 const IDLE_FRAME_RATE: f64 = 0.2;
 
-fn restore_terminal() {
-    crossterm::execute!(
-        std::io::stdout(),
-        crossterm::event::DisableBracketedPaste,
-        crossterm::event::DisableFocusChange,
-        crossterm::event::DisableMouseCapture,
+fn restore_terminal(write: &mut impl std::io::Write) {
+    let reset = |code| Csi::Mode(DecMode::ResetDecPrivateMode(DecPrivateMode::Code(code)));
+    let _ = write!(
+        write,
+        "{}{}{}{}{}{}{}{}{}",
+        reset(DecPrivateModeCode::BracketedPaste),
+        reset(DecPrivateModeCode::FocusTracking),
+        reset(DecPrivateModeCode::SGRMouse),
+        reset(DecPrivateModeCode::AnyEventMouse),
+        reset(DecPrivateModeCode::ButtonEventMouse),
+        reset(DecPrivateModeCode::MouseTracking),
         XtShiftEscape::Disable,
         PointerShape::Default,
-        crossterm::event::PopKeyboardEnhancementFlags,
-    )
-    .unwrap_or_else(|e| {
-        log::error!("Failed to restore terminal features: {}", e);
-    });
-    let mut stdout = std::io::stdout();
-    let _ = std::io::Write::flush(&mut stdout);
-    crossterm::terminal::disable_raw_mode().unwrap_or_else(|e| {
-        // Likely from the master pty fd being closed.
-        log::error!("Failed to disable raw mode: {}", e);
-    });
+        Csi::Keyboard(Keyboard::PopFlags(1))
+    );
+    let _ = write.flush();
 }
 
-// Set up terminal features. Mouse capture is handled separately inside
-// MouseState::initialize (called in App::new) based on the configured mode.
 fn configure_terminal(extended_key_codes: bool) {
-    let mut stdout = std::io::stdout();
-    let _ = std::io::Write::flush(&mut stdout);
-    crossterm::terminal::enable_raw_mode().unwrap_or_else(|e| {
-        log::error!("Failed to enable raw mode: {}", e);
-    });
+    let set_mode = |code| Csi::Mode(DecMode::SetDecPrivateMode(DecPrivateMode::Code(code)));
+
     let flags = if extended_key_codes {
         // Enabling REPORT_ALL_KEYS_AS_ESCAPE_CODES causes Ctrl+C to not copy to clipboard in VS Code with default settings
         // because it causes the press of Ctrl to be sent as a key code thus clearing the selection before 'c' is pressed.
         // https://blog.fsck.com/releases/2026/02/26/terminal-keyboard-protocol/ is a good reference for understanding the terminal key code problem.
-        crossterm::event::KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
-            | crossterm::event::KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS
+        KittyKeyboardFlags::DISAMBIGUATE_ESCAPE_CODES | KittyKeyboardFlags::REPORT_ALTERNATE_KEYS
     } else {
-        crossterm::event::KeyboardEnhancementFlags::empty()
+        KittyKeyboardFlags::empty()
     };
-    crossterm::execute!(
-        std::io::stdout(),
-        crossterm::event::EnableBracketedPaste,
-        crossterm::event::EnableFocusChange,
-        crossterm::event::PushKeyboardEnhancementFlags(flags),
-    )
-    .unwrap_or_else(|e| {
-        log::error!("Failed to set terminal features: {}", e);
-    });
-}
-
-fn set_panic_hook() {
-    let hook = std::panic::take_hook();
-    std::panic::set_hook(Box::new(move |info| {
-        restore_terminal();
-        log::error!("Panic: {}", info);
-        hook(info);
-    }));
+    let _ = crate::flush_stdout!(
+        "{}{}{}",
+        set_mode(DecPrivateModeCode::BracketedPaste),
+        set_mode(DecPrivateModeCode::FocusTracking),
+        Csi::Keyboard(Keyboard::PushFlags(flags))
+    );
 }
 
 fn stdin_unavailable_reason() -> Option<&'static str> {
@@ -189,19 +186,6 @@ fn stdin_unavailable_reason() -> Option<&'static str> {
     None
 }
 
-fn poll_terminal_event(timeout: Duration) -> std::io::Result<Option<CrosstermEvent>> {
-    if let Some(reason) = stdin_unavailable_reason() {
-        log::error!("Cannot read terminal events: {}", reason);
-        return Err(Error::new(ErrorKind::UnexpectedEof, reason));
-    }
-
-    if event::poll(timeout)? {
-        event::read().map(Some)
-    } else {
-        Ok(None)
-    }
-}
-
 #[derive(PartialEq, Eq, Debug, Clone)]
 pub enum ExitState {
     WithCommand(String),
@@ -232,27 +216,20 @@ pub fn get_command(settings: &mut Settings) -> ExitState {
         return ExitState::EOF;
     }
 
-    set_panic_hook();
-
     let app = time_it!("startup: app creation", App::new(settings));
 
     let end_state = app.run();
 
-    restore_terminal();
+    restore_terminal(&mut std::io::stdout());
 
     log::debug!("Final state: {:?}", end_state);
     end_state
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum FuzzyHistorySource {
     PastCommands,
-    // CancelledCommands / AgentPrompts are not currently constructed (the
-    // entry points that would do so are gated behind TODOs about UX). Allow
-    // dead_code so the supporting machinery elsewhere is preserved for when
-    // those entry points are wired up.
     CancelledCommands,
-    #[allow(dead_code)]
     AgentPrompts,
 }
 
@@ -373,6 +350,8 @@ pub(crate) enum ContentMode {
 }
 
 pub(crate) struct App<'a> {
+    pub(super) terminal:
+        ratatui::Terminal<ratatui::backend::TerminaBackend<termina::PlatformTerminal>>,
     pub(super) mode: AppRunningState,
     pub(super) buffer: TextBuffer,
     pub(super) formatted_buffer_cache: FormattedBuffer,
@@ -394,7 +373,7 @@ pub(crate) struct App<'a> {
     /// While the new word-under-cursor equals this value, auto-suggest is suppressed.
     pub(super) dismissed_tab_completion_wuc: Option<String>,
     /// Buffer contents at the time the user last dismissed the agent prompts fuzzy history search.
-    pub(super) dismissed_agent_prompts_buffer: Option<String>,
+    pub(super) dismissed_agent_mode_buffer: Option<String>,
     pub(super) mouse_state: MouseState,
     pub(super) content_mode: ContentMode,
     pub(super) last_contents: Option<DrawnContent>,
@@ -449,7 +428,33 @@ impl<'a> App<'a> {
             log::info!("Warming path cache finished in {:?}", start.elapsed());
         });
 
+        let terminal = time_it!("startup: terminal setup", {
+            let event_reader = GLOBAL_EVENT_READER.clone();
+            let mut platform_terminal =
+                termina::PlatformTerminal::with_reader(event_reader).unwrap();
+            platform_terminal.enter_raw_mode().unwrap();
+            platform_terminal.set_panic_hook(|write| restore_terminal(write));
+            configure_terminal(settings.enable_extended_key_codes);
+
+            let backend = ratatui::backend::TerminaBackend::new(platform_terminal);
+            // ponytail: skip upstream v1.5.0's extra `get_cursor_position()`
+            // newline insertion before ratatui's inline-viewport DSR. That
+            // query blocks up to 2s and, on a zpty with no terminal answering
+            // `ESC[6n`, consumes the next scripted line as the "reply".
+            // Ratatui still probes once; mid-line wrap is the upgrade path
+            // if we add a non-blocking probe.
+
+            ratatui::Terminal::with_options(
+                backend,
+                TerminalOptions {
+                    viewport: Viewport::Inline(0),
+                },
+            )
+            .expect("Failed to create terminal")
+        });
+
         let mut app = App {
+            terminal,
             mode: AppRunningState::Running,
             buffer,
             formatted_buffer_cache,
@@ -479,7 +484,7 @@ impl<'a> App<'a> {
             inline_history_suggestion: None,
             dismissed_inline_suggestion_buffer: None,
             dismissed_tab_completion_wuc: None,
-            dismissed_agent_prompts_buffer: None,
+            dismissed_agent_mode_buffer: None,
             mouse_state: time_it!(
                 "startup: mouse state",
                 MouseState::initialize(&settings.mouse_mode)
@@ -533,12 +538,6 @@ impl<'a> App<'a> {
     }
 
     pub fn run(mut self) -> ExitState {
-        // ponytail: skip upstream v1.4.0's extra `cursor::position()` before
-        // ratatui's inline-viewport DSR. That query blocks up to 2s and, on a
-        // zpty with no terminal answering `ESC[6n`, consumes the next scripted
-        // line as the "reply". Ratatui still probes once; mid-line wrap is the
-        // upgrade path if we add a non-blocking probe.
-
         // Send execution finished escape codes (previous command has completed).
         time_it!("startup: escape codes", {
             if self.settings.send_shell_integration_codes == settings::ShellIntegrationLevel::Full {
@@ -553,54 +552,24 @@ impl<'a> App<'a> {
             }
         });
 
-        let mut terminal = time_it!("startup: terminal setup", {
-            configure_terminal(self.settings.enable_extended_key_codes);
+        if crate::shell::backend().is_bash() {
+            bash_symbols::set_readline_state(bash_symbols::RL_STATE_TERMPREPPED);
+        }
 
-            let terminal = match ratatui::Terminal::with_options(
-                ratatui::backend::CrosstermBackend::new(std::io::stdout()),
-                TerminalOptions {
-                    viewport: Viewport::Inline(0),
-                },
-            ) {
-                Ok(terminal) => terminal,
-                Err(err)
-                    if err.to_string().contains(
-                        "The cursor position could not be read within a normal duration",
-                    ) =>
-                {
-                    // We could just bomb out here.
-                    // I sometimes get this when running flyline in zellij.
-                    log::error!(
-                        "Inline viewport startup failed ({}); falling back to fullscreen viewport",
-                        err
-                    );
-
-                    crossterm::execute!(
-                        std::io::stdout(),
-                        crossterm::terminal::Clear(crossterm::terminal::ClearType::All),
-                        crossterm::cursor::MoveTo(0, 0)
-                    )
-                    .unwrap_or_else(|e| {
-                        log::error!("Failed to clear terminal: {}", e);
-                    });
-
-                    // The cursor is often still messed up here.
-                    ratatui::Terminal::with_options(
-                        ratatui::backend::CrosstermBackend::new(std::io::stdout()),
-                        TerminalOptions {
-                            viewport: Viewport::Fullscreen,
-                        },
-                    )
-                    .expect("Failed to create terminal with fullscreen viewport")
-                }
-                Err(err) => panic!("Failed to create terminal: {}", err),
-            };
-
-            if crate::shell::backend().is_bash() {
-                bash_symbols::set_readline_state(bash_symbols::RL_STATE_TERMPREPPED);
+        let event_reader = self.terminal.backend_mut().terminal_mut().event_reader();
+        let poll_terminal_event = |event_reader: &termina::EventReader,
+                                   timeout: Duration|
+         -> std::io::Result<Option<TerminaEvent>> {
+            if let Some(reason) = stdin_unavailable_reason() {
+                log::error!("Cannot read terminal events: {}", reason);
+                return Err(Error::new(ErrorKind::UnexpectedEof, reason));
             }
-            terminal
-        });
+
+            if event_reader.poll(Some(timeout), |_| true)? {
+                return event_reader.read(|_| true).map(Some);
+            }
+            Ok(None)
+        };
 
         // Enable mouse capture only now that the inline viewport (and its
         // cursor-position probe) is established. Doing it earlier lets a mouse
@@ -608,7 +577,7 @@ impl<'a> App<'a> {
         self.mouse_state.enable_if_configured();
 
         let mut redraw = true;
-        let mut last_terminal_size = terminal.size().unwrap();
+        let mut last_terminal_size = self.terminal.size().unwrap();
 
         'main_loop: loop {
             if self.poll_agent() {
@@ -630,12 +599,12 @@ impl<'a> App<'a> {
 
             if redraw {
                 if self.needs_full_redraw {
-                    if let Err(e) = terminal.resize(last_terminal_size.into()) {
+                    if let Err(e) = self.terminal.resize(last_terminal_size.into()) {
                         log::error!("Failed to resync inline viewport after bash command: {}", e);
                     }
                 }
 
-                let frame_area = terminal.get_frame().area();
+                let frame_area = self.terminal.get_frame().area();
 
                 let content =
                     self.create_content(frame_area.width, frame_area.y, last_terminal_size.height);
@@ -658,7 +627,7 @@ impl<'a> App<'a> {
                         frame_area.height,
                         desired_height
                     );
-                    terminal
+                    self.terminal
                         .set_viewport_height(desired_height)
                         .unwrap_or_else(|e| {
                             log::error!("Failed to set viewport height: {}", e);
@@ -666,10 +635,35 @@ impl<'a> App<'a> {
                 }
 
                 let prev_contents = std::mem::take(&mut self.last_contents);
+                let show_terminal_cursor = (self.settings.cursor_config.backend()
+                    == crate::cursor::CursorBackend::Terminal
+                    || !self.mode.is_running())
+                    && !(self.mouse_state.is_left_button_down()
+                        && self.buffer.selection_range().is_some()
+                        && matches!(
+                            self.mouse_state.last_mouse_over_cell_semantic,
+                            Some(Tag::Command(_))
+                        ));
+                let needs_full_redraw = self.needs_full_redraw;
+                if self.needs_full_redraw {
+                    self.needs_full_redraw = false;
+                }
+
+                let mut drawn_content: Option<DrawnContent> = None;
                 let draw_result = {
                     let _timer = crate::perf::PerfTimer::start("draw");
-                    terminal.draw(|f| self.ui(f, content))
+                    self.terminal.draw(|f| {
+                        drawn_content = Some(Self::ui(
+                            f,
+                            content,
+                            needs_full_redraw,
+                            show_terminal_cursor,
+                        ));
+                    })
                 };
+
+                self.last_contents = drawn_content;
+
                 match draw_result {
                     Ok(_) => {
                         self.last_draw_time = std::time::Instant::now();
@@ -702,6 +696,7 @@ impl<'a> App<'a> {
                         self.mode = AppRunningState::Exiting(ExitState::WithoutCommand);
                     }
                 }
+                self.reevaluate_pointer_shape();
             }
 
             if !self.mode.is_running() {
@@ -716,32 +711,32 @@ impl<'a> App<'a> {
             };
             let min_refresh_rate: Duration = Duration::from_millis((1000.0 / effective_fps) as u64);
 
-            redraw = match poll_terminal_event(min_refresh_rate) {
+            redraw = match poll_terminal_event(&event_reader, min_refresh_rate) {
                 Ok(Some(event)) => {
                     let r = match event {
-                        CrosstermEvent::Key(key) => {
+                        TerminaEvent::Key(key) => {
                             self.last_activity_time = std::time::Instant::now();
                             self.handle_key_event(key);
                             true
                         }
-                        CrosstermEvent::Mouse(mouse) => {
+                        TerminaEvent::Mouse(mouse) => {
                             self.last_activity_time = std::time::Instant::now();
                             self.on_mouse(mouse)
                         }
-                        CrosstermEvent::Resize(new_cols, new_rows) => {
-                            // log::trace!("Terminal resized to {}x{}", new_cols, new_rows);
+                        TerminaEvent::WindowResized(winsize) => {
+                            // log::trace!("Terminal resized to {}x{}", winsize.cols, winsize.rows);
                             last_terminal_size = Size {
-                                width: new_cols,
-                                height: new_rows,
+                                width: winsize.cols,
+                                height: winsize.rows,
                             };
                             true
                         }
-                        CrosstermEvent::FocusLost => {
+                        TerminaEvent::FocusOut => {
                             // log::trace!("Terminal focus lost");
                             self.term_has_focus = false;
                             false
                         }
-                        CrosstermEvent::FocusGained => {
+                        TerminaEvent::FocusIn => {
                             // log::trace!("Terminal focus gained");
                             self.term_has_focus = true;
                             if self.settings.mouse_mode == MouseMode::Smart {
@@ -752,13 +747,14 @@ impl<'a> App<'a> {
                             }
                             false
                         }
-                        CrosstermEvent::Paste(pasted) => {
+                        TerminaEvent::Paste(pasted) => {
                             log::trace!("Pasted content: {}", pasted);
                             self.buffer.delete_selection();
                             self.buffer.insert_str(&pasted);
                             self.on_possible_buffer_change();
                             true
                         }
+                        _ => false,
                     };
                     r
                 }
@@ -840,7 +836,6 @@ impl<'a> App<'a> {
 
     /// This is meant to mimic bash_execute_unix_command from bashline.c
     pub(crate) fn run_bash_command(&mut self, cmd: &str) {
-        let extended_key_codes = self.settings.enable_extended_key_codes;
         let mouse_enabled = self.mouse_state.is_enabled();
 
         // 1. Export READLINE_* variables before running command
@@ -860,10 +855,18 @@ impl<'a> App<'a> {
         let _ = crate::bash_funcs::export_env_var("READLINE_ARGUMENT", "1");
 
         // 2. Put terminal back into normal mode
-        restore_terminal();
-        // move cursor to column 0 (matching Readline's rl_clear_visible_line)
         let mut stdout = std::io::stdout();
-        let _ = crossterm::execute!(stdout, crossterm::cursor::MoveToColumn(0));
+        restore_terminal(&mut stdout);
+        if let Err(e) = self
+            .terminal
+            .backend_mut()
+            .terminal_mut()
+            .enter_cooked_mode()
+        {
+            log::error!("Failed to enter cooked mode before bash command: {}", e);
+        }
+        // move cursor to column 0 (matching Readline's rl_clear_visible_line)
+        let _ = write!(stdout, "\r");
         let _ = std::io::Write::flush(&mut stdout);
 
         // 3. Execute command using bash FFI function
@@ -871,8 +874,11 @@ impl<'a> App<'a> {
             log::error!("Failed to execute bash command '{}': {}", cmd, e);
         }
 
-        // 4. Restore terminal back to the mode it was already in
-        configure_terminal(extended_key_codes);
+        // 4. Restore terminal back to raw mode
+        if let Err(e) = self.terminal.backend_mut().terminal_mut().enter_raw_mode() {
+            log::error!("Failed to re-enter raw mode after bash command: {}", e);
+        }
+        configure_terminal(self.settings.enable_extended_key_codes);
         if mouse_enabled {
             self.mouse_state.enable();
         }
@@ -945,6 +951,7 @@ impl<'a> App<'a> {
             matches: Vec::new(),
             time: now,
         });
+        self.mouse_state.last_mouse_pos = Some((mouse.column, mouse.row));
 
         // 1. Resolve tags
         let (direct_tag, mut semantic_tag) = self
@@ -992,6 +999,12 @@ impl<'a> App<'a> {
             MouseEventKind::Up(MouseButton::Right) => {
                 self.mouse_state.take_right_click_down_pos();
             }
+            MouseEventKind::ScrollUp
+            | MouseEventKind::ScrollDown
+            | MouseEventKind::ScrollLeft
+            | MouseEventKind::ScrollRight => {
+                self.mouse_state.record_scroll();
+            }
             _ => {}
         }
 
@@ -1005,35 +1018,22 @@ impl<'a> App<'a> {
 
         let mut matches = Vec::new();
         let mut matched_any = false;
-        let mut has_executed_non_pointer = false;
         for binding in crate::app::actions::mouse::DEFAULT_MOUSE_BINDINGS.iter() {
             if binding.context.evaluate_direct(self) {
-                let is_pointer_action = matches!(
-                    binding.action,
-                    crate::app::actions::mouse::MouseEventAction::SetPointer(_)
-                );
-                if has_executed_non_pointer && !is_pointer_action {
-                    continue;
-                }
-                log::trace!("Matched mouse action: {:?}", binding.action);
-                matches.push((binding.context.display(), format!("{:?}", binding.action)));
+                log::trace!("Matched mouse actions: {:?}", binding.actions);
+                matches.push((binding.context.display(), format!("{:?}", binding.actions)));
 
-                let output = binding.action.run(self, mouse);
-                combined_output.merge(output);
-                matched_any = true;
-                if !is_pointer_action {
-                    has_executed_non_pointer = true;
+                for action in &binding.actions {
+                    let output = action.run(self, mouse);
+                    combined_output.merge(output);
+                    matched_any = true;
                 }
+                break;
             }
         }
 
         let mut redraw = false;
         if matched_any {
-            if let Some(shape) = combined_output.desired_pointer_shape {
-                let is_click_event =
-                    matches!(mouse.kind, MouseEventKind::Down(_) | MouseEventKind::Up(_));
-                self.mouse_state.set_pointer_shape(shape, is_click_event);
-            }
             if combined_output.possible_buffer_change {
                 self.on_possible_buffer_change();
             }
@@ -1080,10 +1080,55 @@ impl<'a> App<'a> {
         redraw
     }
 
+    pub fn reevaluate_pointer_shape(&mut self) {
+        if self.settings.mouse_mode == settings::MouseMode::Disabled {
+            self.mouse_state
+                .set_pointer_shape(crate::mouse_state::PointerShape::Default, false);
+            return;
+        }
+
+        let (col, row) = match self.mouse_state.last_mouse_pos {
+            Some(pos) => pos,
+            None => return,
+        };
+
+        let (direct_tag, semantic_tag) = self
+            .last_contents
+            .as_ref()
+            .and_then(|drawn_contents| drawn_contents.get_tagged_cell(col, row))
+            .map(|(direct, semantic)| (Some(direct), Some(semantic)))
+            .unwrap_or((None, None));
+
+        self.mouse_state.last_mouse_over_cell_semantic = semantic_tag;
+        self.mouse_state.last_mouse_over_cell_direct = direct_tag;
+
+        for binding in crate::app::actions::mouse::DEFAULT_POINTER_SHAPE_BINDINGS.iter() {
+            if binding.context.evaluate_direct(self) {
+                for action in &binding.actions {
+                    if let crate::app::actions::mouse::MouseEventAction::SetPointer(shape) = action
+                    {
+                        let is_click_event = self.last_mouse.as_ref().is_some_and(|m| {
+                            matches!(
+                                m.mouse.kind,
+                                MouseEventKind::Down(_) | MouseEventKind::Up(_)
+                            )
+                        });
+                        self.mouse_state.set_pointer_shape(*shape, is_click_event);
+                        return;
+                    }
+                }
+            }
+        }
+    }
+
     fn copy_to_clipboard(&self, text: &[u8]) -> bool {
-        match crossterm::execute!(
-            std::io::stdout(),
-            crossterm::clipboard::CopyToClipboard::to_clipboard_from(text)
+        let text_str = std::str::from_utf8(text).unwrap_or_default();
+        match crate::flush_stdout!(
+            "{}",
+            termina::escape::osc::Osc::SetSelection(
+                termina::escape::osc::Selection::CLIPBOARD,
+                text_str
+            )
         ) {
             Ok(()) => true,
             Err(e) => {
@@ -1135,6 +1180,8 @@ impl<'a> App<'a> {
                         }
                         Err(e) => {
                             log::warn!("Failed to parse cached AI output: {}", e);
+                            self.dismissed_agent_mode_buffer =
+                                Some(self.buffer.buffer().to_string());
                             self.content_mode = ContentMode::AgentError {
                                 message: format!("Failed to parse cached AI output: {}", e),
                                 raw_output: raw_output.clone(),
@@ -1214,6 +1261,8 @@ impl<'a> App<'a> {
                         }
                         Err(e) => {
                             log::warn!("AI command returned no suggestions: {}", e);
+                            self.dismissed_agent_mode_buffer =
+                                Some(self.buffer.buffer().to_string());
                             self.content_mode = ContentMode::AgentError {
                                 message: format!("Failed to parse AI output: {}", e),
                                 raw_output,
@@ -1227,6 +1276,7 @@ impl<'a> App<'a> {
                     self.settings
                         .agent_prompt_history_manager
                         .set_last_raw_output(raw_output.clone());
+                    self.dismissed_agent_mode_buffer = Some(self.buffer.buffer().to_string());
                     self.content_mode = ContentMode::AgentError {
                         message: msg,
                         raw_output,
@@ -1478,9 +1528,7 @@ impl<'a> App<'a> {
         let flycomp_settings = self.settings.flycomp.clone();
         let shared_handle =
             crate::threads::spawn_thread(crate::threads::ThreadTag::Flycomp, move || {
-                unsafe {
-                    libc::signal(libc::SIGCHLD, libc::SIG_DFL);
-                }
+                crate::reset_sigchld();
                 flycomp::generate_completion_output_with_settings(
                     &synthesis_command,
                     output_format,
@@ -1518,6 +1566,7 @@ impl<'a> App<'a> {
                 )
             }
         };
+        self.dismissed_agent_mode_buffer = Some(self.buffer.buffer().to_string());
         self.content_mode = ContentMode::AgentError {
             message,
             raw_output: String::new(),
@@ -1608,8 +1657,7 @@ impl<'a> App<'a> {
         // Safety: the guard `!ai_command.is_empty()` at the call site ensures
         // cmd_args is non-empty, so split_first() always returns Some.
         let (prog, args) = cmd_args.split_first().expect("ai_command is non-empty");
-        // SIGCHLD was already set to SIG_DFL by `Flyline::get()` before calling
-        // `app::get_command`, so no per-process signal manipulation is needed.
+        crate::reset_sigchld();
         match std::process::Command::new(prog)
             .args(args)
             .arg(&final_arg)
@@ -1626,6 +1674,7 @@ impl<'a> App<'a> {
             }
             Err(e) => {
                 log::error!("Failed to spawn AI command: {}", e);
+                self.dismissed_agent_mode_buffer = Some(self.buffer.buffer().to_string());
                 self.content_mode = ContentMode::AgentError {
                     message: format!("Failed to run AI command: {}", e),
                     raw_output: String::new(),
@@ -1687,15 +1736,21 @@ impl<'a> App<'a> {
 
         let current_buf = self.buffer.buffer().to_string();
         if self
-            .dismissed_agent_prompts_buffer
+            .dismissed_agent_mode_buffer
             .as_deref()
             .is_some_and(|b| b != current_buf)
         {
-            self.dismissed_agent_prompts_buffer = None;
+            self.dismissed_agent_mode_buffer = None;
+        }
+
+        if matches!(self.content_mode, ContentMode::AgentError { .. })
+            && self.dismissed_agent_mode_buffer.is_none()
+        {
+            self.content_mode = ContentMode::Normal;
         }
 
         if !navigated_history && matches!(self.content_mode, ContentMode::Normal) {
-            if self.dismissed_agent_prompts_buffer.is_none()
+            if self.dismissed_agent_mode_buffer.is_none()
                 && let Some((_agent_cmd, _stripped)) =
                     self.buffer_starts_with_agent_command_prefix()
             {

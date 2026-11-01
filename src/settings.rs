@@ -620,7 +620,7 @@ mod tests {
     #[test]
     fn settings_keybindings_remappings_agent_commands_round_trip() {
         use crate::app::actions::{Binding, KeyRemap};
-        use crossterm::event::{KeyCode, KeyModifiers};
+        use termina::event::{KeyCode, Modifiers as KeyModifiers};
 
         let mut s = Settings::default();
 
