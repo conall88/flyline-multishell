@@ -631,20 +631,188 @@ mod tests {
     }
 }
 
+/// Glyphs drawn for `0x5f..=0x7e` while G0 is the DEC Special Graphics set.
+const DEC_SPECIAL_GRAPHICS: [char; 32] = [
+    '\u{a0}', '◆', '▒', '␉', '␌', '␍', '␊', '°', '±', '␤', '␋', '┘', '┐', '┌', '└', '┼', '⎺', '⎻',
+    '─', '⎼', '⎽', '├', '┤', '┴', '┬', '│', '≤', '≥', 'π', '≠', '£', '·',
+];
+
+/// Remove escape sequences that [`ansi_to_tui`] only half-consumes before it
+/// sees the string: it drops the `ESC` of anything that is not CSI (`ESC [`)
+/// or OSC (`ESC ]`) and keeps the rest as text.
+///
+/// - Character-set designations (`ESC` + intermediates `0x20..=0x2f` + final
+///   byte), e.g. terminfo `sgr0` is `ESC ( B ESC [ m` on xterm, which fish 3.x
+///   `set_color normal` and `tput sgr0` emit. Text written while G0 is the
+///   DEC Special Graphics set (`ESC ( 0`) is mapped to the glyphs it draws.
+/// - Private two-byte escapes `ESC 0..=?`, e.g. `ESC 7` / `ESC 8` (save /
+///   restore cursor), `ESC =` / `ESC >` (keypad mode).
+///
+/// CSI and OSC sequences are copied verbatim for [`ansi_to_tui`] to parse.
+pub fn normalize_ansi_escapes(s: &str) -> std::borrow::Cow<'_, str> {
+    if !s.contains('\x1b') {
+        return std::borrow::Cow::Borrowed(s);
+    }
+    let mut out = String::with_capacity(s.len());
+    let mut dec_graphics = false;
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '\x1b' {
+            match c {
+                '\x5f'..='\x7e' if dec_graphics => {
+                    out.push(DEC_SPECIAL_GRAPHICS[c as usize - 0x5f]);
+                }
+                _ => out.push(c),
+            }
+            continue;
+        }
+        match chars.peek().copied() {
+            Some('[') => {
+                out.push(c);
+                out.push(chars.next().unwrap_or('['));
+                while let Some(p) = chars.next_if(|p| ('\x20'..='\x3f').contains(p)) {
+                    out.push(p);
+                }
+                if let Some(f) = chars.next_if(|f| ('\x40'..='\x7e').contains(f)) {
+                    out.push(f);
+                }
+            }
+            Some(']') => {
+                out.push(c);
+                while let Some(o) = chars.next() {
+                    out.push(o);
+                    if o == '\x07' {
+                        break;
+                    }
+                    if o == '\x1b' && chars.peek() == Some(&'\\') {
+                        out.push(chars.next().unwrap_or('\\'));
+                        break;
+                    }
+                }
+            }
+            Some('\x20'..='\x2f') => {
+                let first = chars.next();
+                let mut intermediates = 1;
+                while chars.next_if(|i| ('\x20'..='\x2f').contains(i)).is_some() {
+                    intermediates += 1;
+                }
+                if let Some(f) = chars.next_if(|f| ('\x30'..='\x7e').contains(f))
+                    && first == Some('(')
+                    && intermediates == 1
+                {
+                    dec_graphics = f == '0';
+                }
+            }
+            Some('\x30'..='\x3f') => {
+                chars.next();
+            }
+            _ => out.push(c),
+        }
+    }
+    std::borrow::Cow::Owned(out)
+}
+
+/// Parse an ANSI-escaped string into ratatui [`Text`], after
+/// [`normalize_ansi_escapes`].
+pub fn ansi_to_text(s: &str) -> Result<Text<'static>, ansi_to_tui::Error> {
+    normalize_ansi_escapes(s).as_bytes().into_text()
+}
+
 /// Convert an ANSI-escaped string into a flat list of styled [`Span`]s.
 ///
-/// The string is parsed through [`ansi_to_tui`] so that ANSI colour/style
+/// The string is parsed through [`ansi_to_text`] so that ANSI colour/style
 /// codes are converted to ratatui span styles.  If parsing fails the raw text
 /// is returned as a single unstyled span.  Spans from all resulting lines are
 /// flattened into one sequence (descriptions are expected to be single-line).
 pub fn ansi_string_to_spans(s: &str) -> Vec<Span<'static>> {
-    let owned = s.to_owned();
-    match owned.into_text() {
+    match ansi_to_text(s) {
         Ok(text) => {
             let res = text.lines.into_iter().flat_map(|l| l.spans).collect();
             res
         }
         Err(_) => vec![Span::raw(s.to_owned())],
+    }
+}
+
+#[cfg(test)]
+mod ansi_escape_tests {
+    use super::*;
+
+    fn plain(s: &str) -> String {
+        ansi_to_text(s)
+            .unwrap()
+            .lines
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn fish3_default_prompt_has_no_charset_text() {
+        // fish 3.7 `fish_prompt` with TERM=xterm-256color: set_color normal is sgr0.
+        let prompt =
+            "\x1b[92mubuntu\x1b(B\x1b[m@cursor\x1b(B\x1b[m \x1b[32m/tmp\x1b(B\x1b[m\x1b(B\x1b[m> ";
+        assert_eq!(plain(prompt), "ubuntu@cursor /tmp> ");
+        let spans = &ansi_to_text(prompt).unwrap().lines[0].spans;
+        assert_eq!(spans[0].content, "ubuntu");
+        assert_eq!(spans[0].style.fg, Some(Color::LightGreen));
+        assert_eq!(spans[1].content, "@cursor");
+        assert_eq!(spans[1].style.fg, Some(Color::Reset));
+    }
+
+    #[test]
+    fn tput_sgr0_in_bash_style_prompt() {
+        assert_eq!(plain("\x1b[1;31mroot\x1b(B\x1b[m:~# "), "root:~# ");
+    }
+
+    #[test]
+    fn dec_line_drawing_maps_to_box_glyphs() {
+        assert_eq!(plain("\x1b(0lqqk\x1b(B ok"), "┌──┐ ok");
+        assert_eq!(plain("\x1b(0x\nmj\x1b(Bx"), "│\n└┘x");
+    }
+
+    #[test]
+    fn dec_line_drawing_leaves_csi_intact() {
+        let text = ansi_to_text("\x1b(0\x1b[31mq\x1b[0m\x1b(B").unwrap();
+        let span = &text.lines[0].spans[0];
+        assert_eq!(span.content, "─");
+        assert_eq!(span.style.fg, Some(Color::Red));
+    }
+
+    #[test]
+    fn g1_designation_does_not_switch_g0() {
+        assert_eq!(plain("\x1b)0q"), "q");
+    }
+
+    #[test]
+    fn private_two_byte_escapes_are_dropped() {
+        assert_eq!(plain("a\x1b7b\x1b8c\x1b=d\x1b>e"), "abcde");
+    }
+
+    #[test]
+    fn osc_with_bel_still_parsed_by_ansi_to_tui() {
+        assert_eq!(plain("\x1b]0;title\x07\x1b(0q\x1b(Bok"), "─ok");
+    }
+
+    #[test]
+    fn text_without_escapes_is_borrowed() {
+        assert!(matches!(
+            normalize_ansi_escapes("plain $ "),
+            std::borrow::Cow::Borrowed("plain $ ")
+        ));
+    }
+
+    #[test]
+    fn description_spans_drop_charset_text() {
+        let spans = ansi_string_to_spans("\x1b[2mdesc\x1b(B\x1b[m");
+        let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(text, "desc");
     }
 }
 
